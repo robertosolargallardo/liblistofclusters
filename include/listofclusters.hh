@@ -17,7 +17,6 @@ class listofclusters{
 
 	private:	list_t _list;
 				supercluster_t _leftovers;
-				uint32_t _oid;
 				uint32_t _cid;
 
 	public:	listofclusters(void);
@@ -25,7 +24,8 @@ class listofclusters{
 				listofclusters& operator=(const listofclusters&);
 				~listofclusters(void);
 
-				void insert(const object_t&);
+				void insert(const object_t&,const uint32_t&);
+				void remove(const object_t&,const uint32_t&);
 
 				resultslist_t knn_search(const object_t&,const uint32_t&,const size_t&);
 				resultslist_t range_search(const object_t&,const uint32_t&,const double&);
@@ -36,21 +36,18 @@ class listofclusters{
 };
 template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
 listofclusters<object_t,distance,bucket_size,overflow>::listofclusters(void){
-   this->_oid=0U;
    this->_cid=0U;
 	this->_leftovers.reserve(overflow);
 }
 
 template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
 listofclusters<object_t,distance,bucket_size,overflow>::listofclusters(const listofclusters &_listofclusters){
-	this->_oid=_listofclusters._oid;
 	this->_cid=_listofclusters._cid;
 	this->_list=_listofclusters._list;
 	this->_leftovers=_listofclusters._leftovers;
 }
 template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
 listofclusters<object_t,distance,bucket_size,overflow>& listofclusters<object_t,distance,bucket_size,overflow>::operator=(const listofclusters &_listofclusters){
-	this->_oid=_listofclusters._oid;
 	this->_cid=_listofclusters._cid;
 	this->_list=_listofclusters._list;
 	this->_leftovers=_listofclusters._leftovers;
@@ -62,22 +59,46 @@ listofclusters<object_t,distance,bucket_size,overflow>::~listofclusters(void){
 	this->_list.clear();
 	this->_leftovers.clear();
 }
+template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
+void listofclusters<object_t,distance,bucket_size,overflow>::remove(const object_t &_object,const uint32_t &_id){
+	double dist=0.0;
+	bool exit=false;
+
+	for(auto& clusters : this->_list){
+		for(auto& cluster : clusters){
+			dist=distance(cluster.centroid().object(),_object);
+			if(dist<=cluster.radius()){
+				cluster.remove(_id);
+				if(cluster.empty()){
+					uint32_t id=cluster.id();
+					clusters.erase(std::find_if(clusters.begin(),clusters.end(),[&id](const cluster_t &_cluster)->bool{return(_cluster.id()==id);}));
+				}
+				exit=true;
+				break;
+			}
+		}
+		if(exit) break;
+	}
+
+	if(!exit)
+		this->_leftovers.erase(std::find_if(this->_leftovers.begin(),this->_leftovers.end(),[&_id](const internal_object_t &_object)->bool{return(_object.id()==_id);}));
+}
 
 template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object_t &_object){
+void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object_t &_object,const uint32_t &_id){
 	double dist=0.0;
 
 	for(auto& clusters : this->_list){
 		for(auto& cluster : clusters){
 			dist=distance(cluster.centroid().object(),_object);
 			if(dist<=cluster.radius()){
-				cluster.insert(_object,this->_oid++,dist);
+				cluster.insert(_object,_id,dist);
 				return;
 			}
 		}
 	}
 
-	this->_leftovers.push_back(internal_object_t(_object,this->_oid++));
+	this->_leftovers.push_back(internal_object_t(_object,_id));
 
 	if(this->_leftovers.size()==overflow){
 		unsigned seed=std::chrono::system_clock::now().time_since_epoch().count();
@@ -203,6 +224,9 @@ typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t l
 
 	do{
 		this->range_search(results,radius);
+
+		if(radius!=std::numeric_limits<double>::max()) break;
+
 		radius+=radius*0.1;
 	}while(results.results().size()<_k);
 

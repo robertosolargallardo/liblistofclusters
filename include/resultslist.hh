@@ -29,14 +29,6 @@ class resultslist{
 				results_t results(void){
 					return(this->_results);
 				}
-
-				friend std::ostream& operator<< (std::ostream& stream,const resultslist &_resultslist){
-					stream << _resultslist._centroid << std::endl;
-					stream << _resultslist._results.size() << std::endl;
-					for(auto& object : _resultslist._results)
-						stream << object << std::endl;
-					return(stream);
-				}
 };
 template<class object_t>
 resultslist<object_t>::resultslist(void){

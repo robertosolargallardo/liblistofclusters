@@ -54,10 +54,6 @@ class internal_object{
 				void distance(const double &_distance){
 					this->_distance=_distance;
 				}
-				friend std::ostream& operator<< (std::ostream& stream,const internal_object &_object){
-					stream << _object._id << " " << _object._distance;
-					return(stream);
-				}
 };
 }
 #endif
