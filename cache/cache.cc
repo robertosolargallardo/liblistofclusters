@@ -9,7 +9,7 @@
 
 #define IS_K 100
 #define CS_K 10
-#define CS_N 10
+#define CS_N 1000
 
 typedef arma::rowvec sift_t;
 
@@ -84,14 +84,14 @@ class cache_service{
 					metric::resultslist<sift_t> query(metric::internal_object<sift_t>(_query,_idq),CS_K);
 
 					auto results=this->_index.knn_search(query,_idq,CS_K);
-					std::cout << results.results().size() << std::endl;
+					std::cout << "k : " << results.results().size() << std::endl;
 					return(result);	
 				}
 				bool evaluate(const metric::resultslist<sift_t> &_cached){
 					return(false);
 				}
 				void insert(const metric::resultslist<sift_t> &_result){
-					std::cout << "cache insert" << std::endl;
+					std::cout << "cache insert :" << this->_cache.size() <<std::endl;
 					this->_index.insert(_result,_result.centroid().id());
 					this->_cache[_result.centroid().id()]=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
 					this->_objects[_result.centroid().id()]=_result;
@@ -102,10 +102,6 @@ class cache_service{
 						this->_index.remove(this->_objects[id],id);
 						this->_objects.erase(std::find_if(this->_objects.begin(),this->_objects.end(),[&id](decltype(this->_objects)::value_type &a)->bool{return(a.first==id);}));
 						this->_cache.erase(min);
-
-						std::cout << "cache size " << this->_cache.size() << std::endl;
-						std::cout << "objects size " << this->_objects.size() << std::endl;
-						exit(0);
 					}
 				}
 };
