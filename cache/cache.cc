@@ -9,7 +9,7 @@
 
 #define IS_K 10
 #define CS_K 5
-#define CS_N 250
+#define CS_N 1000
 
 typedef arma::rowvec sift_t;
 
