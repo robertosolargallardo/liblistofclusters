@@ -7,9 +7,9 @@
 #include <memory>
 #include <math.h>
 
-#define IS_K 100
-#define CS_K 10
-#define CS_N 1000
+#define IS_K 10
+#define CS_K 5
+#define CS_N 250
 
 typedef arma::rowvec sift_t;
 
@@ -62,8 +62,10 @@ class cache_service{
 				std::map<uint32_t,std::chrono::milliseconds>   _cache;
 				std::map<uint32_t,metric::resultslist<sift_t>> _objects;
 
+				std::ofstream _fdata;
+
 	public:  cache_service(void){
-					;
+					this->_fdata=std::ofstream("data.txt");
 				}
 				cache_service(const cache_service &_cs){
 					this->_index=_cs._index;
@@ -75,23 +77,51 @@ class cache_service{
 					return(*this);
 				}
 				~cache_service(void){
+					this->_fdata.close();
 					this->_cache.clear();
 				}
 				metric::resultslist<sift_t> search(const sift_t &_query,const uint32_t &_idq){
-					std::cout << "cache search" << std::endl;
+				   metric::resultslist<sift_t> c(metric::internal_object<sift_t>(_query,_idq),IS_K);
+					metric::resultslist<sift_t> q(metric::internal_object<sift_t>(_query,_idq),CS_K);
 				
-					metric::resultslist<sift_t> result;
-					metric::resultslist<sift_t> query(metric::internal_object<sift_t>(_query,_idq),CS_K);
+					if(this->_cache.size()>=CS_N){
+						double dqc=0.0,doc=0.0,d=0.0;
+						double radius=std::numeric_limits<double>::max();
 
-					auto results=this->_index.knn_search(query,_idq,CS_K);
-					std::cout << "k : " << results.results().size() << std::endl;
-					return(result);	
+						auto r=this->_index.knn_search(q,_idq,CS_K);
+
+						/*saving data to train*/
+						for(auto& i : r.results())
+							this->_fdata << i.distance() << " " << i.object().results().rbegin()->distance() << " ";
+						this->_fdata << std::endl;
+						/*saving data to train*/
+
+						for(auto& i : r.results()){
+							dqc=i.distance();
+
+							for(auto& j : i.object().results()){
+								doc=j.distance();
+
+								if((dqc-doc)<=radius){
+									d=idistance(_query,j.object());
+									c.push(j.object(),j.id(),d);
+								}
+		
+								if(c.results().size()==IS_K)
+									radius=c.results().rbegin()->distance();
+							}
+						}
+
+
+					}
+					return(c);	
 				}
 				bool evaluate(const metric::resultslist<sift_t> &_cached){
 					return(false);
 				}
 				void insert(const metric::resultslist<sift_t> &_result){
-					std::cout << "cache insert :" << this->_cache.size() <<std::endl;
+					if(this->_cache.size()==CS_N) return;
+
 					this->_index.insert(_result,_result.centroid().id());
 					this->_cache[_result.centroid().id()]=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
 					this->_objects[_result.centroid().id()]=_result;
@@ -119,14 +149,31 @@ int main(int argc,char** argv){
 		queries.push_back(id);
 	fqueries.close();
 
+	std::ofstream fcs("cs.txt");
+	std::ofstream fis("is.txt");
+
 	for(size_t i=0;i<queries.size();++i){
-		metric::resultslist<sift_t> cached=cs->search(DB.row(queries[i]),queries[i]);
-		bool hit=cs->evaluate(cached);
+		metric::resultslist<sift_t> c=cs->search(DB.row(queries[i]),queries[i]);
+
+		if(!c.results().empty()){
+			for(auto& i : c.results())
+				fcs << i.id() << " " << i.distance() << " "; 
+			fcs << std::endl;
+		}
+
+		bool hit=cs->evaluate(c);
 
 		if(!hit){
-			metric::resultslist<sift_t> result=is->search(DB.row(queries[i]),queries[i]);
-			cs->insert(result);
+			metric::resultslist<sift_t> r=is->search(DB.row(queries[i]),queries[i]);
+			cs->insert(r);
+
+			for(auto& i : r.results())
+				fis << i.id() << " " << i.distance() << " "; 
+			fis << std::endl;
 		}
 	}
+
+	fcs.close();
+	fis.close();
 	return(0);
 }
