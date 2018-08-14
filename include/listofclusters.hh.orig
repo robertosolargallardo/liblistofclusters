@@ -180,14 +180,13 @@ template <class object_t,double (*distance)(object_t,object_t),size_t bucket_siz
 typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t listofclusters<object_t,distance,bucket_size,overflow>::range_search(const object_t &_object,const uint32_t &_id,const double &_radius)
 {
     resultslist_t results(internal_object_t(_object,_id));
-    double dist=0.0;
     this->range_search(results,_radius);
 
-    for(auto& object : this->_leftovers)
+	 for(auto& object : this->_leftovers)
         {
-            dist=this->internal_distance(results.centroid(),object);
+            dist=this->internal_distance(_results.centroid(),object);
             if(dist<=_radius)
-                results.push(object.object(),object.id(),dist);
+                _results.push(object.object(),object.id(),dist);
         }
 
     this->_dcache.clear();
@@ -230,12 +229,11 @@ void listofclusters<object_t,distance,bucket_size,overflow>::explore(resultslist
     for(auto& object : _cluster.bucket())
         {
             dist=this->internal_distance(_results.centroid(),_cluster.centroid());
-            if((dist-_radius)<=object.distance())
-                {
-                    dist=this->internal_distance(_results.centroid(),object);
-                    if(dist<=_radius)
-                        _results.push(object.object(),object.id(),dist);
-                }
+            if((dist-_radius)<=object.distance()){
+            	dist=this->internal_distance(_results.centroid(),object);
+            	if(dist<=_radius)
+               	_results.push(object.object(),object.id(),dist);
+				}
         }
 }
 template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
@@ -257,12 +255,11 @@ typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t l
                             exit=true;
                             break;
                         }
-                    else
-                        {
-                            diff=dist-cluster.radius();
-                            if(diff<radius)
-                                radius=diff;
-                        }
+                    else{
+							 diff=dist-cluster.radius();
+							 if(diff<radius)
+                        radius=diff;
+						  }
                 }
             if(exit)
                 break;
@@ -275,14 +272,14 @@ typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t l
             radius+=radius*ALFA;
         }
     while(results.results().size()<_k);
-
+    
     for(auto& object : this->_leftovers)
         {
-            dist=this->internal_distance(results.centroid(),object);
-            if(dist<=radius)
-                results.push(object.object(),object.id(),dist);
+            dist=this->internal_distance(_results.centroid(),object);
+            if(dist<=_radius)
+                _results.push(object.object(),object.id(),dist);
         }
-
+	
     this->_dcache.clear();
     return(results);
 }

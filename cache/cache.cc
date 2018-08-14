@@ -157,7 +157,7 @@ int main(int argc,char** argv){
 
 		if(!c.results().empty()){
 			for(auto& i : c.results())
-				fcs << i.id() << " " << i.distance() << " "; 
+				fcs << i.distance() << " "; 
 			fcs << std::endl;
 		}
 
@@ -168,7 +168,7 @@ int main(int argc,char** argv){
 			cs->insert(r);
 
 			for(auto& i : r.results())
-				fis << i.id() << " " << i.distance() << " "; 
+				fis << i.distance() << " "; 
 			fis << std::endl;
 		}
 	}
