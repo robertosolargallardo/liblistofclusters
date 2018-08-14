@@ -41,12 +41,15 @@ public:
 
     uint32_t id(void) const;
 
+	 size_t size(void) const;
+    void clear(void);
+
 };
 template<class object_t>
 cluster<object_t>::cluster(void)
 {
     this->_radius=0.0;
-    this->_ghost=false;
+    this->_ghost=true;
 }
 
 template<class object_t>
@@ -88,6 +91,8 @@ cluster<object_t>::cluster(const uint32_t &_id,const internal_object_t &_centroi
 template<class object_t>
 void cluster<object_t>::insert(const object_t &_object,const uint32_t &_id,const double &_distance)
 {
+    if(_distance>this->_radius)
+        this->_radius=_distance;
     this->_bucket.insert(internal_object_t(_object,_id,_distance));
 }
 
@@ -131,6 +136,17 @@ template<class object_t>
 uint32_t cluster<object_t>::id(void) const
 {
     return(this->_id);
+}
+
+template<class object_t>
+size_t cluster<object_t>::size(void) const{
+	return((this->_ghost?0:1)+this->_bucket.size());
+}
+template<class object_t>
+void cluster<object_t>::clear(void){
+	this->_ghost=true;
+	this->_radius=0.0;
+	this->_bucket.clear();
 }
 };
 #endif

@@ -156,6 +156,7 @@ int main(int argc,char** argv){
 		metric::resultslist<sift_t> c=cs->search(DB.row(queries[i]),queries[i]);
 
 		if(!c.results().empty()){
+			fcs << queries[i] << " ";
 			for(auto& i : c.results())
 				fcs << i.distance() << " "; 
 			fcs << std::endl;
@@ -167,9 +168,12 @@ int main(int argc,char** argv){
 			metric::resultslist<sift_t> r=is->search(DB.row(queries[i]),queries[i]);
 			cs->insert(r);
 
-			for(auto& i : r.results())
-				fis << i.distance() << " "; 
-			fis << std::endl;
+			if(!c.results().empty()){
+		   	fis << queries[i] << " ";
+				for(auto& i : r.results())
+					fis << i.distance() << " "; 
+				fis << std::endl;
+			}
 		}
 	}
 

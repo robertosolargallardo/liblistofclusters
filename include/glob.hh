@@ -15,4 +15,5 @@
 #include <stdint.h>
 #define ALFA              0.1
 #define MAX_DCACHE_SIZE   1000
+#define SUPERCLUSTER      0U
 #endif
