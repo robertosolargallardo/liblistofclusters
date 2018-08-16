@@ -41,7 +41,7 @@ public:
 
     uint32_t id(void) const;
 
-	 size_t size(void) const;
+    size_t size(void) const;
     void clear(void);
 
 };
@@ -139,14 +139,16 @@ uint32_t cluster<object_t>::id(void) const
 }
 
 template<class object_t>
-size_t cluster<object_t>::size(void) const{
-	return((this->_ghost?0:1)+this->_bucket.size());
+size_t cluster<object_t>::size(void) const
+{
+    return((this->_ghost?0:1)+this->_bucket.size());
 }
 template<class object_t>
-void cluster<object_t>::clear(void){
-	this->_ghost=true;
-	this->_radius=0.0;
-	this->_bucket.clear();
+void cluster<object_t>::clear(void)
+{
+    this->_ghost=true;
+    this->_radius=0.0;
+    this->_bucket.clear();
 }
 };
 #endif

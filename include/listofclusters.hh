@@ -35,17 +35,18 @@ public:
     resultslist_t knn_search(const object_t&,const uint32_t&,const size_t&);
     resultslist_t range_search(const object_t&,const uint32_t&,const double&);
 
-	 void show(void){
-/*************/
+    void show(void)
+    {
+        /*************/
 
-for(auto& clusters : this->_list)
-{
-	for(auto& cluster : clusters)
-		std::cout << cluster.id() << " " << cluster.size() << " " << cluster.radius() << std::endl;
-}
-/*************/
+        for(auto& clusters : this->_list)
+            {
+                for(auto& cluster : clusters)
+                    std::cout << cluster.id() << " " << cluster.size() << " " << cluster.radius() << std::endl;
+            }
+        /*************/
 
-	 }
+    }
 
 private:
     void range_search(resultslist_t&,const double&);
@@ -168,13 +169,13 @@ void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object
                         }
                     this->_supercluster.clear();
 
-	                 if(bucket.empty()) break;
+                    if(bucket.empty()) break;
 
                     auto max=std::max_element(accum.begin(),accum.end(),[](const decltype(accum)::value_type &a,const decltype(accum)::value_type &b)->bool{return(a.second<b.second);});
                     auto centroid=std::find_if(bucket.begin(),bucket.end(),[id=max->first](const internal_object_t &_object)->bool{return(_object.id()==id);});
 
                     this->_supercluster=cluster_t(SUPERCLUSTER,*centroid);
-						  accum.erase(max);
+                    accum.erase(max);
                     bucket.erase(centroid);
 
                     for(auto& object : bucket)
