@@ -13,5 +13,4 @@ for i in range(0,len(IS)):
 	if rem < 0:
 		print IS[i]
 		print CS[i]
-		break
 	#print rem,res

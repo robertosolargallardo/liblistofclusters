@@ -44,6 +44,8 @@ public:
     size_t size(void) const;
     void clear(void);
 
+    bool ghost(void) const;
+
 };
 template<class object_t>
 cluster<object_t>::cluster(void)
@@ -149,6 +151,10 @@ void cluster<object_t>::clear(void)
     this->_ghost=true;
     this->_radius=0.0;
     this->_bucket.clear();
+}
+template<class object_t>
+bool cluster<object_t>::ghost(void) const{
+    return(this->_ghost);
 }
 };
 #endif

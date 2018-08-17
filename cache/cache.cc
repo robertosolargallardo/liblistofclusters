@@ -25,7 +25,7 @@ double cdistance(metric::resultslist<sift_t> a,metric::resultslist<sift_t> b){
 arma::mat DB;
 
 class index_service{
-	private:	metric::listofclusters<sift_t,idistance,50,100000> _index;
+	private:	metric::listofclusters<sift_t,idistance,10,10000> _index;
 	
 	public:	index_service(void){
 					;
@@ -40,7 +40,6 @@ class index_service{
 					auto end=std::chrono::system_clock::now();
 					auto elapsed=std::chrono::duration_cast<std::chrono::seconds>(end-start);
 					std::cout << "indexing time : " << elapsed.count() << " seconds " << std::endl;
-					_index.show();
 
 				}
 				index_service(const index_service &_is){
@@ -154,7 +153,6 @@ int main(int argc,char** argv){
 	std::ofstream fis("is.txt");
 
 	for(size_t i=0;i<queries.size();++i){
-	 	std::cout << i << " " << queries[i] << std::endl;
 		metric::resultslist<sift_t> c=cs->search(DB.row(queries[i]),queries[i]);
 
 		if(!c.results().empty()){
@@ -167,12 +165,7 @@ int main(int argc,char** argv){
 		bool hit=cs->evaluate(c);
 
 		if(!hit){
-			auto start=std::chrono::system_clock::now();
 			metric::resultslist<sift_t> r=is->search(DB.row(queries[i]),queries[i]);
-			auto end=std::chrono::system_clock::now();
-			auto elapsed=std::chrono::duration_cast<std::chrono::seconds>(end-start);
-			std::cout << "searching time : " << elapsed.count() << " seconds " << std::endl;
-
 
 			cs->insert(r);
 
