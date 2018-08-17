@@ -242,8 +242,8 @@ template <class object_t,double (*distance)(object_t,object_t),size_t bucket_siz
 typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t listofclusters<object_t,distance,bucket_size,overflow>::knn_search(const object_t &_object,const uint32_t &_id,const size_t &_k)
 {
     resultslist_t results(internal_object_t(_object,_id),_k);
-    double radius=INFINITY;
-    double min_external_radius=INFINITY;
+    double radius=MAX_RADIUS;
+    double min_external_radius=MAX_RADIUS;
     double dist=0.0,diff=0.0;
 
     for(auto& clusters : this->_list)
@@ -255,17 +255,17 @@ typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t l
 
                     if(diff>0.0 && diff<radius)
                         radius=diff;
-                    else if((-diff)>0.0 (-diff)<min_external_radius)
+                    else if((-diff)>0.0 && (-diff)<min_external_radius)
                         min_external_radius=(-diff);
                 }
         }
 
-    radius=(radius==INFINITY)?min_external_radius:radius;
+    radius=(radius==MAX_RADIUS)?min_external_radius:radius;
 
     do
         {
             this->range_search(results,radius);
-            if(radius==INFINITY || radius==0.0) break;
+            if(radius==MAX_RADIUS || radius==0.0) break;
             radius+=radius*ALFA;
         }
     while(results.results().size()<_k);
