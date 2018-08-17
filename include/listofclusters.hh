@@ -122,7 +122,7 @@ void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object
                 }
         }
 
-    exit:
+exit:
 
     if(this->_supercluster.empty())
         this->_supercluster=cluster_t(SUPERCLUSTER,internal_object_t(_object,_id));
@@ -192,7 +192,7 @@ typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t l
 {
     resultslist_t results(internal_object_t(_object,_id));
     this->range_search(results,_radius);
-    
+
     double dist=this->internal_distance(results.centroid(),this->_supercluster.centroid());
     if((dist-_radius)<=this->_supercluster.radius())
         this->explore(results,this->_supercluster,_radius);

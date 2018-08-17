@@ -153,7 +153,8 @@ void cluster<object_t>::clear(void)
     this->_bucket.clear();
 }
 template<class object_t>
-bool cluster<object_t>::ghost(void) const{
+bool cluster<object_t>::ghost(void) const
+{
     return(this->_ghost);
 }
 };
