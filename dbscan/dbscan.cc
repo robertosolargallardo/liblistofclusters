@@ -16,87 +16,104 @@ double idistance(sift_t a,sift_t b)
 }
 arma::mat DB;
 
-class dbscan{
-	private:	metric::listofclusters<sift_t,idistance,10,1000> _index;
-				std::vector<uint32_t> _ids;
-				std::map<uint32_t,std::vector<uint32_t>> _clusters;
+class dbscan
+{
+private:
+    metric::listofclusters<sift_t,idistance,10,1000> _index;
+    std::vector<uint32_t> _ids;
+    std::map<uint32_t,std::vector<uint32_t>> _clusters;
 
-	public: 	dbscan(void){
-				
-				}
-			 	dbscan(const dbscan &_dbscan){
-					this->_index=_dbscan._index;
-					this->_ids=_dbscan._ids;
-				}
-			 	dbscan& operator=(const dbscan &_dbscan){
-					this->_index=_dbscan._index;
-					this->_ids=_dbscan._ids;
-					return(*this);
-				}
-				~dbscan(void){
-					;
-				}
-				dbscan(const std::string &_filename){
-    				uint32_t id=0U;
-					std::ifstream ftrain(_filename);
-    				while(ftrain >> id){
-						this->_ids.push_back(id);
-						this->_index.insert(DB.row(id),id);
-					}
-    				ftrain.close();
-				}
+public:
+    dbscan(void)
+    {
 
-				void scan(const double &_epsilon,const size_t &_min_size){
-					unsigned seed=std::chrono::system_clock::now().time_since_epoch().count();
-					std::mt19937 rng(seed);
-					uint32_t id=0;
+    }
+    dbscan(const dbscan &_dbscan)
+    {
+        this->_index=_dbscan._index;
+        this->_ids=_dbscan._ids;
+    }
+    dbscan& operator=(const dbscan &_dbscan)
+    {
+        this->_index=_dbscan._index;
+        this->_ids=_dbscan._ids;
+        return(*this);
+    }
+    ~dbscan(void)
+    {
+        ;
+    }
+    dbscan(const std::string &_filename)
+    {
+        uint32_t id=0U;
+        std::ifstream ftrain(_filename);
+        while(ftrain >> id)
+            {
+                this->_ids.push_back(id);
+                this->_index.insert(DB.row(id),id);
+            }
+        ftrain.close();
+    }
 
-					while(!this->_ids.empty()){
-						std::uniform_int_distribution<size_t> uniform(0,this->_ids.size()-1);
+    void scan(const double &_epsilon,const size_t &_min_size)
+    {
+        unsigned seed=std::chrono::system_clock::now().time_since_epoch().count();
+        std::mt19937 rng(seed);
+        uint32_t id=0;
 
-						id=this->_ids[uniform(rng)];
-						this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id](const uint32_t _id)->bool{return(_id==id);}));
-						this->_index.remove(DB.row(id),id);
+        while(!this->_ids.empty())
+            {
+                std::uniform_int_distribution<size_t> uniform(0,this->_ids.size()-1);
 
-						auto query=this->_index.range_search(DB.row(id),id,_epsilon);
+                id=this->_ids[uniform(rng)];
+                this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id](const uint32_t _id)->bool{return(_id==id);}));
+                this->_index.remove(DB.row(id),id);
 
-						if(query.results().size()>=_min_size){
-							for(auto result : query.results()){
-								this->_clusters[id].push_back(result.id());
-						      this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id=result.id()](const uint32_t _id)->bool{return(_id==id);}));
-								this->_index.remove(DB.row(result.id()),result.id());
-							}
-							this->expand(id,_epsilon,_min_size);
+                auto query=this->_index.range_search(DB.row(id),id,_epsilon);
 
-							std::cout << "size " << this->_clusters[id].size() << std::endl;
-						}
-					}
-				}
-				void expand(const uint32_t &_centroid,const double &_epsilon,const size_t &_min_size){
-					size_t N=this->_clusters[_centroid].size();
-					uint32_t id=0U;
+                if(query.results().size()>=_min_size)
+                    {
+                        for(auto result : query.results())
+                            {
+                                this->_clusters[id].push_back(result.id());
+                                this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id=result.id()](const uint32_t _id)->bool{return(_id==id);}));
+                                this->_index.remove(DB.row(result.id()),result.id());
+                            }
+                        this->expand(id,_epsilon,_min_size);
 
-					for(size_t i=0;i<N;++i){
-						id=this->_clusters[_centroid][i];
-						auto query=this->_index.range_search(DB.row(id),id,_epsilon);
-						
-						if(query.results().size()>=_min_size){
-							for(auto result : query.results()){
-								this->_clusters[_centroid].push_back(result.id());
-						      this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id=result.id()](const uint32_t _id)->bool{return(_id==id);}));
-								this->_index.remove(DB.row(result.id()),result.id());
-								++N;
-							}	
-						}
-					}
-				}
+                        std::cout << "size " << this->_clusters[id].size() << std::endl;
+                    }
+            }
+    }
+    void expand(const uint32_t &_centroid,const double &_epsilon,const size_t &_min_size)
+    {
+        size_t N=this->_clusters[_centroid].size();
+        uint32_t id=0U;
+
+        for(size_t i=0; i<N; ++i)
+            {
+                id=this->_clusters[_centroid][i];
+                auto query=this->_index.range_search(DB.row(id),id,_epsilon);
+
+                if(query.results().size()>=_min_size)
+                    {
+                        for(auto result : query.results())
+                            {
+                                this->_clusters[_centroid].push_back(result.id());
+                                this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id=result.id()](const uint32_t _id)->bool{return(_id==id);}));
+                                this->_index.remove(DB.row(result.id()),result.id());
+                                ++N;
+                            }
+                    }
+            }
+    }
 };
 int main(int argc,char** argv)
 {
     DB.load(argv[1],arma::csv_ascii);
-	 dbscan db(argv[2]);
+    dbscan db(argv[2]);
 
-	 db.scan(275.0,5);
+    db.scan(275.0,5);
 
     return(0);
 }
