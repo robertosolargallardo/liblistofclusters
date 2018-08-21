@@ -225,7 +225,7 @@ void listofclusters<object_t,distance,bucket_size,overflow>::explore(resultslist
     double dist=0.0;
     double dqc=this->internal_distance(_results.centroid(),_cluster.centroid());
 
-    if(dqc<=_radius && !_cluster.ghost())
+    if(dqc<=_radius && !_cluster.ghost() && _cluster.centroid().id()!=_results.centroid().id())
         _results.push(_cluster.centroid().object(),_cluster.centroid().id(),dqc);
 
     for(auto& object : _cluster.bucket())
@@ -233,7 +233,7 @@ void listofclusters<object_t,distance,bucket_size,overflow>::explore(resultslist
             if((dqc-_radius)<=object.distance() && (dqc+_radius)>=object.distance())
                 {
                     dist=this->internal_distance(_results.centroid(),object);
-                    if(dist<=_radius)
+                    if(dist<=_radius && _results.centroid().id()!=object.id())
                         _results.push(object.object(),object.id(),dist);
                 }
         }
