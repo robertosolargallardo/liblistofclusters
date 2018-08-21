@@ -73,7 +73,7 @@ template <class object_t,double (*distance)(object_t,object_t),size_t bucket_siz
 void listofclusters<object_t,distance,bucket_size,overflow>::remove(const object_t &_object,const uint32_t &_id)
 {
     double dist=0.0;
-
+	 
     for(auto& clusters : this->_list)
         {
             for(auto& cluster : clusters)
@@ -184,6 +184,15 @@ exit:
 
             this->_list.push_back(clusters);
             this->_dcache.clear();
+					
+				internal_object_t centroid=this->_supercluster.centroid();
+            typename cluster_t::bucket_t bucket=this->_supercluster.bucket();
+
+				this->_supercluster.clear();
+
+				this->insert(centroid.object(),centroid.id());
+            for(auto& object : bucket)
+					this->insert(object.object(),object.id());
         }
 }
 

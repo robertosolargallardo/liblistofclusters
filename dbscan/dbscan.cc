@@ -51,24 +51,43 @@ class dbscan{
 					unsigned seed=std::chrono::system_clock::now().time_since_epoch().count();
 					std::mt19937 rng(seed);
 					uint32_t id=0;
+					size_t fail=0;
 
-					while(!this->_ids.empty()){
+					while(this->_ids.size()!=fail){
 						std::uniform_int_distribution<size_t> uniform(0,this->_ids.size()-1);
 						id=this->_ids[uniform(rng)];
 						auto query=this->_index.range_search(DB.row(id),id,_epsilon);
 
 						if(query.results().size()>=_min_size){
-							this->_mark[id]=true;
+							fail=0;
+							std::cout << id << std::endl;
+							this->_index.remove(DB.row(id),id);
+						   this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id](const uint32_t _id)->bool{return(_id==id);}));
+
 							for(auto result : query.results()){
-								this->_clusters[id].push_back(result.id());
-								this->_mark[result.id()]=true;
+								std::cout << result.id() << std::endl;
+								this->_index.remove(DB.row(result.id()),result.id());
+						      this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id=result.id()](const uint32_t _id)->bool{return(_id==id);}));
+							}
+							std::cout << "SIZE : " << this->_ids.size() << std::endl;
+							/*this->_mark[id]=true;
+					      this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id](const uint32_t _id)->bool{return(_id==id);}));
+
+							for(auto result : query.results()){
+								if(!this->_mark.count(result.id())){
+									this->_clusters[id].push_back(result.id());
+									this->_mark[result.id()]=true;
+						      	this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id=result.id()](const uint32_t _id)->bool{return(_id==id);}));
+								}
 							}
 
 							this->scan(id,_epsilon,_min_size);
 
 							std::cout << this->_clusters[id].size() << std::endl;
-							exit(0);
+							std::cout << "SIZE : " << this->_ids.size() << std::endl;
+							getchar();*/
 						}
+						else fail++;
 					}
 				}
 				void scan(const uint32_t &_centroid,const double &_epsilon,const size_t &_min_size){
@@ -84,6 +103,7 @@ class dbscan{
 								if(!this->_mark.count(result.id())){
 									this->_clusters[_centroid].push_back(result.id());
 									this->_mark[result.id()]=true;
+						         this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id=result.id()](const uint32_t _id)->bool{return(_id==id);}));
 									++N;
 								}
 							}	
@@ -96,7 +116,7 @@ int main(int argc,char** argv)
     DB.load(argv[1],arma::csv_ascii);
 	 dbscan db(argv[2]);
 
-	 db.scan(200.0,10);
+	 db.scan(250.0,10);
     
     return(0);
 }
