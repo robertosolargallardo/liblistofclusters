@@ -107,7 +107,7 @@ void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object
                             cluster.insert(_object,_id,dist);
                             if(cluster.size()>overflow)
                                 {
-                                    cluster_t full=cluster;
+                                    cluster_t full=cluster; 
                                     clusters.erase(std::find_if(clusters.begin(),clusters.end(),[id=cluster.id()](const cluster_t &_cluster)->bool{return(_cluster.id()==id);}));
 
                                     this->insert(full.centroid().object(),full.centroid().id());
@@ -136,7 +136,6 @@ exit:
         {
             std::map<uint32_t,double> accum;
             std::vector<cluster_t> clusters;
-            clusters.reserve(size_t(std::ceil(double(overflow)/double(bucket_size))));
 
             do
                 {
@@ -148,7 +147,9 @@ exit:
                     cluster.radius(it->distance());
                     clusters.push_back(cluster);
 
-                    for(size_t i=0; i<bucket_size && !bucket.empty(); ++i)
+                    size_t N=std::distance(bucket.begin(),std::find_if(bucket.begin(),bucket.end(),[maxdist=cluster.radius()](const internal_object_t &_object)->bool{return(_object.distance()>maxdist);}));
+
+                    for(size_t i=0; i<N && !bucket.empty(); ++i)
                         {
                             auto object=*bucket.begin();
                             for(size_t j=0; j<clusters.size(); ++j)
