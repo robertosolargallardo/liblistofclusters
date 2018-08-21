@@ -96,7 +96,7 @@ int main(int argc,char** argv)
     DB.load(argv[1],arma::csv_ascii);
 	 dbscan db(argv[2]);
 
-	 db.scan(250.0,3);
+	 db.scan(275.0,5);
 
     return(0);
 }
