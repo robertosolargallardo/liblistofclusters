@@ -32,11 +32,13 @@ public:
     {
         this->_index=_dbscan._index;
         this->_ids=_dbscan._ids;
+        this->_clusters=_dbscan._clusters;
     }
     dbscan& operator=(const dbscan &_dbscan)
     {
         this->_index=_dbscan._index;
         this->_ids=_dbscan._ids;
+        this->_clusters=_dbscan._clusters;
         return(*this);
     }
     ~dbscan(void)
