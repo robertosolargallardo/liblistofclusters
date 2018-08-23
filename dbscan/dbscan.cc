@@ -83,7 +83,6 @@ public:
                             }
                         this->expand(id,_epsilon,_min_size);
 
-                        std::cout << "size " << this->_clusters[id].size() << std::endl;
                     }
             }
     }

@@ -235,7 +235,7 @@ void listofclusters<object_t,distance,bucket_size,overflow>::explore(resultslist
     double dist=0.0;
     double dqc=this->internal_distance(_results.centroid(),_cluster.centroid());
 
-    if(dqc<=_radius && !_cluster.ghost() && _cluster.centroid().id()!=_results.centroid().id())
+    if(dqc<=_radius && !_cluster.centroid().ghost() && _cluster.centroid().id()!=_results.centroid().id())
         _results.push(_cluster.centroid().object(),_cluster.centroid().id(),dqc);
 
     for(auto& object : _cluster.bucket())
