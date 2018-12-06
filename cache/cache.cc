@@ -107,14 +107,9 @@ public:
             {
                 double dqc=0.0,doc=0.0,d=0.0;
                 double radius=std::numeric_limits<double>::max();
+                std::map<uint32_t,uint32_t> belongs;
 
                 auto r=this->_index.knn_search(q,_idq,CS_K);
-
-                /*saving data to train*/
-                for(auto& i : r.results())
-                    this->_fdata << i.distance() << " " << i.object().results().rbegin()->distance() << " ";
-                this->_fdata << std::endl;
-                /*saving data to train*/
 
                 for(auto& i : r.results())
                     {
@@ -128,12 +123,21 @@ public:
                                     {
                                         d=idistance(_query,j.object());
                                         c.push(j.object(),j.id(),d);
+                                        belongs[j.id()]=i.id();//TODO
                                     }
 
                                 if(c.results().size()==IS_K)
                                     radius=c.results().rbegin()->distance();
                             }
                     }
+					 /*saving data to train*/
+                std::map<uint32_t,uint32_t> total;
+                for(auto& i : c.results())
+					     total[belongs[i.id()]]++;
+                for(auto& i : r.results())
+                    this->_fdata << i.distance() << " " << i.object().results().rbegin()->distance() << " " << total[i.id()] << " ";
+                this->_fdata << std::endl;
+                /*saving data to train*/
 
 
             }

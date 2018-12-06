@@ -43,7 +43,7 @@ public:
     }
     ~dbscan(void)
     {
-        ;
+        this->_clusters.clear();
     }
     dbscan(const std::string &_filename)
     {
@@ -61,14 +61,16 @@ public:
     {
         unsigned seed=std::chrono::system_clock::now().time_since_epoch().count();
         std::mt19937 rng(seed);
-        uint32_t id=0;
+        uint32_t id=0U;
+        uint32_t cid=0U;
+   
+        std::shuffle(this->_ids.begin(),this->_ids.end(),rng);
 
         while(!this->_ids.empty())
             {
-                std::uniform_int_distribution<size_t> uniform(0,this->_ids.size()-1);
 
-                id=this->_ids[uniform(rng)];
-                this->_ids.erase(std::find_if(this->_ids.begin(),this->_ids.end(),[id](const uint32_t _id)->bool{return(_id==id);}));
+                id=this->_ids.back();
+                this->_ids.pop_back();
                 this->_index.remove(DB.row(id),id);
 
                 auto query=this->_index.range_search(DB.row(id),id,_epsilon);
@@ -83,6 +85,11 @@ public:
                             }
                         this->expand(id,_epsilon,_min_size);
 
+                        std::ofstream fcluster("cluster_"+std::to_string(cid++)+".txt");
+								fcluster << id << std::endl;
+								for(auto& i : this->_clusters[id])
+								    fcluster << i << std::endl;
+								fcluster.close();
                     }
             }
     }
@@ -114,7 +121,7 @@ int main(int argc,char** argv)
     DB.load(argv[1],arma::csv_ascii);
     dbscan db(argv[2]);
 
-    db.scan(275.0,5);
+    db.scan(std::stof(argv[3]),std::stoi(argv[4]));
 
     return(0);
 }

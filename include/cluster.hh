@@ -142,6 +142,7 @@ void cluster<object_t>::clear(void)
 {
     this->_radius=0.0;
     this->_bucket.clear();
+    this->_centroid.ghost(true);
 }
 };
 #endif

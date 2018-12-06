@@ -13,7 +13,7 @@
 #include <iostream>
 #include <stddef.h>
 #include <stdint.h>
-#define ALFA              0.1
-#define SUPERCLUSTER      0U
-#define MAX_RADIUS        std::numeric_limits<double>::max()
+#define RADIUS_INC_PERC  0.1
+#define SUPERCLUSTER     std::numeric_limits<uint32_t>::max()
+#define MAX_RADIUS       std::numeric_limits<double>::max()
 #endif

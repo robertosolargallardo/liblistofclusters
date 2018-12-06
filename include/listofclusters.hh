@@ -31,9 +31,18 @@ public:
 
     void insert(const object_t&,const uint32_t&);
     void remove(const object_t&,const uint32_t&);
+    void clear(void);
 
     resultslist_t knn_search(const object_t&,const uint32_t&,const size_t&);
     resultslist_t range_search(const object_t&,const uint32_t&,const double&);
+
+
+    void centroids(void)
+    {
+        for(auto& clusters : this->_list)
+            for(auto& cluster : clusters)
+                std::cout << cluster.centroid().id() << std::endl;
+    }
 
 private:
     void range_search(resultslist_t&,const double&);
@@ -45,7 +54,7 @@ private:
 template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
 listofclusters<object_t,distance,bucket_size,overflow>::listofclusters(void)
 {
-    this->_cid=1U;
+    this->_cid=0U;
 }
 
 template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
@@ -73,7 +82,7 @@ template <class object_t,double (*distance)(object_t,object_t),size_t bucket_siz
 void listofclusters<object_t,distance,bucket_size,overflow>::remove(const object_t &_object,const uint32_t &_id)
 {
     double dist=0.0;
-	 
+
     for(auto& clusters : this->_list)
         {
             for(auto& cluster : clusters)
@@ -107,7 +116,7 @@ void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object
                             cluster.insert(_object,_id,dist);
                             if(cluster.size()>overflow)
                                 {
-                                    cluster_t full=cluster; 
+                                    cluster_t full=cluster;
                                     clusters.erase(std::find_if(clusters.begin(),clusters.end(),[id=cluster.id()](const cluster_t &_cluster)->bool{return(_cluster.id()==id);}));
 
                                     this->insert(full.centroid().object(),full.centroid().id());
@@ -185,15 +194,15 @@ exit:
 
             this->_list.push_back(clusters);
             this->_dcache.clear();
-					
-				internal_object_t centroid=this->_supercluster.centroid();
+
+            internal_object_t centroid=this->_supercluster.centroid();
             typename cluster_t::bucket_t bucket=this->_supercluster.bucket();
 
-				this->_supercluster.clear();
+            this->_supercluster.clear();
 
-				this->insert(centroid.object(),centroid.id());
+            this->insert(centroid.object(),centroid.id());
             for(auto& object : bucket)
-					this->insert(object.object(),object.id());
+                this->insert(object.object(),object.id());
         }
 }
 
@@ -276,7 +285,7 @@ typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t l
         {
             this->range_search(results,radius);
             if(radius==MAX_RADIUS || radius==0.0) break;
-            radius+=radius*ALFA;
+            radius+=radius*RADIUS_INC_PERC;
         }
     while(results.results().size()<_k);
 
@@ -297,6 +306,11 @@ double listofclusters<object_t,distance,bucket_size,overflow>::internal_distance
 
     return(this->_dcache[_a.id()][_b.id()]);
 }
-
+template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
+void listofclusters<object_t,distance,bucket_size,overflow>::clear(void)
+{
+    this->_list.clear();
+    this->_supercluster.clear();
+}
 };
 #endif
