@@ -50,6 +50,25 @@ public:
     void remove(const object_t&, const uint32_t&);
     void clear(void) noexcept;
 
+    // Sequential batch insert. Convenience wrapper for inserting many
+    // (object, id) pairs from a single call. Equivalent to a manual loop
+    // of insert(); kept for API symmetry with batch_knn. NOT internally
+    // parallelized - concurrent inserts into the same _list would race.
+    void insert(const std::vector<object_t> &objs,
+                const std::vector<uint32_t> &ids);
+
+    // Canonical static LC build from the original paper (Chavez & Navarro,
+    // PRL 2005, Figure 1). For each cluster we pick a center then take the
+    // bucket_size NEAREST points as its bucket (vs incremental insert, which
+    // packs whoever happens to fall inside the radius by arrival order).
+    // Clusters built this way are spatially tight, so triangle-inequality
+    // pruning fires more often at query time. Trades build time for query
+    // time, as the paper intends.
+    //
+    // Replaces any existing index state (clear() is called first).
+    void bulk_build(const std::vector<object_t> &objs,
+                    const std::vector<uint32_t> &ids);
+
     // Queries are read-only with respect to the index: they only touch _list
     // and the (stateless) metric. Multiple knn_search/range_search/batch_knn
     // calls on the same index are safe to run concurrently. Concurrent
@@ -151,6 +170,101 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::clear(void) noexc
 {
     this->_list.clear();
     this->_cid = 0U;
+}
+
+// ---------------------------------------------------------------------------
+// insert (batch) - sequential ergonomic wrapper around insert().
+// ---------------------------------------------------------------------------
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::insert(
+    const std::vector<object_t> &objs,
+    const std::vector<uint32_t> &ids)
+{
+    const std::size_t n = std::min(objs.size(), ids.size());
+    this->_list.reserve(this->_list.size() + n / bucket_size + 1);
+    for (std::size_t i = 0; i < n; ++i)
+        this->insert(objs[i], ids[i]);
+}
+
+// ---------------------------------------------------------------------------
+// bulk_build - canonical static LC construction (Chavez & Navarro 2005 §3).
+//
+// Replaces existing index state. For each cluster:
+//   1. Pick a center c from the still-unassigned points (first one, as in
+//      the paper's pseudocode).
+//   2. Compute d(c, u) for every other unassigned u.
+//   3. Take the bucket_size nearest unassigned points as the bucket; the
+//      radius is the largest of those distances.
+//   4. Mark all selected points (center + bucket) as assigned.
+//   5. Repeat with what's left.
+//
+// Complexity: O((n / bucket_size) * n) distance computations. Slower than
+// incremental insert (which is O(n * |list|) but with a smaller list), but
+// produces tighter clusters - better pruning at query time.
+// ---------------------------------------------------------------------------
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
+    const std::vector<object_t> &objs,
+    const std::vector<uint32_t> &ids)
+{
+    this->clear();
+    const std::size_t n = std::min(objs.size(), ids.size());
+    if (n == 0) return;
+
+    std::vector<char> assigned(n, 0);
+    std::size_t remaining = n;
+    std::vector<std::pair<double, std::size_t>> scratch;
+    scratch.reserve(n);
+
+    this->_list.reserve(n / bucket_size + 1);
+
+    while (remaining > 0)
+        {
+            // 1. Pick the first unassigned point as the next center.
+            std::size_t c_idx = 0;
+            while (c_idx < n && assigned[c_idx]) ++c_idx;
+            assigned[c_idx] = 1;
+            --remaining;
+
+            if (remaining == 0)
+                {
+                    // Lone leftover: a cluster with just a centroid.
+                    this->_list.emplace_back(this->_cid++,
+                                             internal_object_t(objs[c_idx], ids[c_idx]));
+                    break;
+                }
+
+            // 2. Distances from center to all other unassigned points.
+            scratch.clear();
+            scratch.reserve(remaining);
+            for (std::size_t i = 0; i < n; ++i)
+                {
+                    if (assigned[i]) continue;
+                    scratch.emplace_back(this->_metric(objs[c_idx], objs[i]), i);
+                }
+
+            // 3. Bring the bucket_size nearest to the front (don't sort the tail).
+            const std::size_t take = std::min<std::size_t>(bucket_size, scratch.size());
+            if (take < scratch.size())
+                std::nth_element(scratch.begin(), scratch.begin() + take, scratch.end(),
+                    [](const auto &a, const auto &b) noexcept { return a.first < b.first; });
+            std::sort(scratch.begin(), scratch.begin() + take,
+                [](const auto &a, const auto &b) noexcept { return a.first < b.first; });
+
+            // 4. Build the cluster.
+            cluster_t cluster(this->_cid++,
+                              internal_object_t(objs[c_idx], ids[c_idx]));
+            for (std::size_t i = 0; i < take; ++i)
+                {
+                    const auto &[d, idx] = scratch[i];
+                    cluster.insert(objs[idx], ids[idx], d);
+                    assigned[idx] = 1;
+                }
+            remaining -= take;
+            this->_list.push_back(std::move(cluster));
+        }
 }
 
 // ---------------------------------------------------------------------------

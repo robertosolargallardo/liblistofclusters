@@ -262,6 +262,93 @@ static void test_batch_knn_matches_serial()
     std::cout << "  test_batch_knn_matches_serial: OK (" << Qn << " queries)\n";
 }
 
+// Both build paths must produce indexes whose knn results match brute-force
+// ground truth. Clusters differ between incremental and bulk_build (different
+// arrangement), but recall@k against brute force must be 1.000 for both.
+static void test_bulk_build_matches_brute_force()
+{
+    constexpr std::uint32_t N = 200U;
+    constexpr std::size_t D = 6U;
+    constexpr std::size_t k = 5U;
+
+    std::vector<vec_t> db(N);
+    std::vector<std::uint32_t> ids(N);
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        ids[i] = i;
+    }
+
+    // Build via bulk_build.
+    idx_t idx;
+    idx.bulk_build(db, ids);
+    assert(!idx.empty());
+
+    constexpr int queries = 10;
+    int hits = 0;
+    int expected = 0;
+    for (int q = 0; q < queries; ++q) {
+        vec_t query(D);
+        for (std::size_t j = 0; j < D; ++j) query[j] = u(rng);
+
+        std::vector<std::pair<double, std::uint32_t>> bf;
+        bf.reserve(N);
+        for (std::uint32_t i = 0; i < N; ++i) bf.emplace_back(bf_dist(query, db[i]), i);
+        std::sort(bf.begin(), bf.end());
+
+        std::vector<std::uint32_t> want;
+        for (std::size_t i = 0; i < k; ++i) want.push_back(bf[i].second);
+
+        auto res = idx.knn_search(query, N + q, k);
+        std::vector<std::uint32_t> got;
+        for (const auto &r : res.results()) got.push_back(r.id());
+
+        std::sort(want.begin(), want.end());
+        std::sort(got.begin(), got.end());
+        for (auto id : want) {
+            if (std::find(got.begin(), got.end(), id) != got.end()) ++hits;
+            ++expected;
+        }
+    }
+    assert(hits == expected && "bulk_build knn missed brute-force neighbors");
+    std::cout << "  test_bulk_build_matches_brute_force: OK (" << hits
+              << "/" << expected << " recall over " << queries << " queries)\n";
+}
+
+// Sequential batch insert must produce the same index state as a serial loop.
+static void test_batch_insert_matches_serial()
+{
+    constexpr std::uint32_t N = 100U;
+    constexpr std::size_t D = 4U;
+
+    std::vector<vec_t> db(N);
+    std::vector<std::uint32_t> ids(N);
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        ids[i] = i;
+    }
+
+    idx_t a, b;
+    a.insert(db, ids);                              // batch entry point
+    for (std::uint32_t i = 0; i < N; ++i) b.insert(db[i], ids[i]);  // serial loop
+
+    // Each inserted id should be retrievable from both (1-NN of itself).
+    for (std::uint32_t i = 0; i < N; ++i) {
+        auto ra = a.knn_search(db[i], N + i, 1);
+        auto rb = b.knn_search(db[i], N + i, 1);
+        bool a_has = false, b_has = false;
+        for (const auto &r : ra.results()) if (r.id() == i) { a_has = true; break; }
+        for (const auto &r : rb.results()) if (r.id() == i) { b_has = true; break; }
+        assert(a_has && b_has && "insert(batch) result differs from serial insert");
+    }
+    std::cout << "  test_batch_insert_matches_serial: OK (" << N << " ids)\n";
+}
+
 int main()
 {
     std::cout << "liblistofclusters smoke tests:\n";
@@ -271,6 +358,8 @@ int main()
     test_large_n_no_crash();
     test_knn_matches_brute_force();
     test_batch_knn_matches_serial();
+    test_batch_insert_matches_serial();
+    test_bulk_build_matches_brute_force();
     std::cout << "all tests passed\n";
     return 0;
 }

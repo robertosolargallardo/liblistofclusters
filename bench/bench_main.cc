@@ -225,6 +225,51 @@ bench_knn_brute(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
     return summarize(std::move(samples_ns), queries.size());
 }
 
+// Bulk build via Index::bulk_build (canonical LC static construction).
+[[nodiscard]] static Stats
+bench_bulk_build(const std::vector<vec_t> &db, int repeats)
+{
+    std::vector<std::uint32_t> ids(db.size());
+    for (std::uint32_t i = 0; i < db.size(); ++i) ids[i] = i;
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    for (int r = 0; r < repeats; ++r) {
+        idx_t<> idx;
+        const double ns = time_ns([&] {
+            idx.bulk_build(db, ids);
+        });
+        samples_ns.push_back(ns);
+    }
+    return summarize(std::move(samples_ns), db.size());
+}
+
+// kNN throughput against an index built by bulk_build (vs incremental).
+[[nodiscard]] static Stats
+bench_knn_bulk(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+               std::size_t k, int repeats)
+{
+    std::vector<std::uint32_t> ids(db.size());
+    for (std::uint32_t i = 0; i < db.size(); ++i) ids[i] = i;
+    idx_t<> idx;
+    idx.bulk_build(db, ids);
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    volatile std::size_t sink = 0;
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            for (std::uint32_t q = 0; q < queries.size(); ++q) {
+                auto res = idx.knn_search(queries[q], static_cast<std::uint32_t>(db.size() + q), k);
+                sink += res.results().size();
+            }
+        });
+        samples_ns.push_back(ns);
+    }
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
 // kNN LC, batched across worker threads via Index::batch_knn.
 [[nodiscard]] static Stats
 bench_knn_lc_parallel(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
@@ -529,13 +574,23 @@ int main(int argc, char **argv)
 
     print_header();
 
-    // 1. Build (insert all N).
+    // 1. Build (insert all N), incremental.
     const Stats s_insert = bench_insert(db, /*repeats=*/5);
-    print_row("insert (LC)", N, s_insert);
+    print_row("insert (LC, incremental)", N, s_insert);
 
-    // 2. kNN throughput (LC), queries only - excludes build.
+    // 1b. Build via bulk_build (canonical static LC construction).
+    const Stats s_bulk = bench_bulk_build(db, /*repeats=*/3);
+    print_row("insert (LC, bulk_build)", N, s_bulk);
+
+    // 2. kNN throughput (LC, incrementally built), queries only.
     const Stats s_knn_lc = bench_knn(db, queries, k, /*repeats=*/5);
-    print_row("knn k=10 (LC, 1T)", Q, s_knn_lc);
+    print_row("knn k=10 (LC incr, 1T)", Q, s_knn_lc);
+
+    // 2a. kNN throughput against a bulk-built index. Same queries, same N,
+    //     same metric - the only difference is the cluster shapes from the
+    //     two build strategies.
+    const Stats s_knn_bulk = bench_knn_bulk(db, queries, k, /*repeats=*/5);
+    print_row("knn k=10 (LC bulk, 1T)", Q, s_knn_bulk);
 
     // 2b. kNN throughput (LC) via batch_knn parallelized across hw threads.
     const unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
