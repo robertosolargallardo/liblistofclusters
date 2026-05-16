@@ -1,4 +1,5 @@
 #include <listofclusters/listofclusters.hh>
+#include <listofclusters/metrics.hh>
 
 #include <algorithm>
 #include <cassert>
@@ -349,6 +350,102 @@ static void test_batch_insert_matches_serial()
     std::cout << "  test_batch_insert_matches_serial: OK (" << N << " ids)\n";
 }
 
+// Built-in metric functors: sanity-check the values against hand-computed
+// expected distances on small vectors.
+static void test_builtin_metrics()
+{
+    using v2 = std::vector<double>;
+    const v2 a = {1.0, 2.0};
+    const v2 b = {4.0, 6.0};  // diff: 3, 4 -> L2=5, L1=7, Linf=4
+
+    auto approx = [](double x, double y, double eps = 1e-9) {
+        return std::abs(x - y) < eps;
+    };
+
+    assert(approx(metric::euclidean{}(a, b), 5.0));
+    assert(approx(metric::manhattan{}(a, b), 7.0));
+    assert(approx(metric::chebyshev{}(a, b), 4.0));
+    assert(approx(metric::minkowski<3>{}(a, b),
+                  std::pow(std::pow(3.0, 3.0) + std::pow(4.0, 3.0), 1.0 / 3.0)));
+
+    // Identity (axiom 2): d(x, x) == 0
+    assert(approx(metric::euclidean{}(a, a), 0.0));
+    assert(approx(metric::manhattan{}(a, a), 0.0));
+    assert(approx(metric::chebyshev{}(a, a), 0.0));
+
+    // Symmetry (axiom 3): d(x, y) == d(y, x)
+    assert(approx(metric::euclidean{}(a, b), metric::euclidean{}(b, a)));
+    assert(approx(metric::manhattan{}(a, b), metric::manhattan{}(b, a)));
+
+    // Hamming on integer vectors.
+    const std::vector<int> p = {1, 2, 3, 4, 5};
+    const std::vector<int> q = {1, 0, 3, 0, 5};  // two diffs
+    assert(metric::hamming{}(p, q) == 2.0);
+    assert(metric::hamming{}(p, p) == 0.0);
+
+    // Angular: two parallel vectors are at distance 0.
+    const v2 unit_x = {1.0, 0.0};
+    assert(approx(metric::angular{}(unit_x, unit_x), 0.0));
+    const v2 unit_y = {0.0, 1.0};
+    assert(approx(metric::angular{}(unit_x, unit_y), M_PI / 2.0));
+
+    // Index plugs into euclidean functor exactly like the inline test type.
+    metric::listofclusters<v2, metric::euclidean, 4, 16> idx;
+    idx.insert(a, 0U);
+    idx.insert(b, 1U);
+    idx.insert({0.0, 0.0}, 2U);
+    auto r = idx.knn_search(a, 99U, 2);
+    assert(r.results().size() >= 1);
+
+    std::cout << "  test_builtin_metrics: OK (euclidean, manhattan, chebyshev, minkowski<3>, hamming, angular)\n";
+}
+
+// Batch remove should leave the index in the same state as a serial loop
+// of remove() calls and removed ids must no longer be retrievable.
+static void test_batch_remove()
+{
+    constexpr std::uint32_t N = 100U;
+    constexpr std::size_t D = 4U;
+
+    std::vector<vec_t> db(N);
+    std::vector<std::uint32_t> ids(N);
+    std::mt19937 rng(13);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        ids[i] = i;
+    }
+
+    idx_t idx;
+    idx.insert(db, ids);
+
+    // Remove the first half via batch_remove.
+    std::vector<vec_t> rm_objs(db.begin(), db.begin() + N/2);
+    std::vector<std::uint32_t> rm_ids(ids.begin(), ids.begin() + N/2);
+    idx.remove(rm_objs, rm_ids);
+
+    // The removed ids should no longer be findable as 1-NN of themselves.
+    int leaked = 0;
+    for (std::uint32_t i = 0; i < N/2; ++i) {
+        auto r = idx.knn_search(db[i], N + i, 1);
+        for (const auto &x : r.results())
+            if (x.id() == i) ++leaked;
+    }
+    assert(leaked == 0 && "removed ids still retrievable");
+
+    // Surviving ids must still be retrievable.
+    int found = 0;
+    for (std::uint32_t i = N/2; i < N; ++i) {
+        auto r = idx.knn_search(db[i], N + i, 1);
+        for (const auto &x : r.results())
+            if (x.id() == i) { ++found; break; }
+    }
+    assert(found == static_cast<int>(N/2) && "surviving ids not retrievable after batch remove");
+
+    std::cout << "  test_batch_remove: OK (removed " << N/2 << ", " << found << " survivors retrievable)\n";
+}
+
 int main()
 {
     std::cout << "liblistofclusters smoke tests:\n";
@@ -360,6 +457,8 @@ int main()
     test_batch_knn_matches_serial();
     test_batch_insert_matches_serial();
     test_bulk_build_matches_brute_force();
+    test_builtin_metrics();
+    test_batch_remove();
     std::cout << "all tests passed\n";
     return 0;
 }

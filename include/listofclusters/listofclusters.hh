@@ -57,6 +57,12 @@ public:
     void insert(const std::vector<object_t> &objs,
                 const std::vector<uint32_t> &ids);
 
+    // Sequential batch delete. Convenience wrapper for removing many
+    // (object, id) pairs in one call. Same not-parallel constraint as
+    // batch insert.
+    void remove(const std::vector<object_t> &objs,
+                const std::vector<uint32_t> &ids);
+
     // Canonical static LC build from the original paper (Chavez & Navarro,
     // PRL 2005, Figure 1). For each cluster we pick a center then take the
     // bucket_size NEAREST points as its bucket (vs incremental insert, which
@@ -185,6 +191,20 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::insert(
     this->_list.reserve(this->_list.size() + n / bucket_size + 1);
     for (std::size_t i = 0; i < n; ++i)
         this->insert(objs[i], ids[i]);
+}
+
+// ---------------------------------------------------------------------------
+// remove (batch) - sequential ergonomic wrapper around remove().
+// ---------------------------------------------------------------------------
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::remove(
+    const std::vector<object_t> &objs,
+    const std::vector<uint32_t> &ids)
+{
+    const std::size_t n = std::min(objs.size(), ids.size());
+    for (std::size_t i = 0; i < n; ++i)
+        this->remove(objs[i], ids[i]);
 }
 
 // ---------------------------------------------------------------------------
