@@ -30,6 +30,10 @@
 
 #include <listofclusters/listofclusters.hh>
 
+// Vendored hnswlib for the approximate-NN baseline (phase 5b). Header-only,
+// MIT licensed; see third_party/hnswlib/LICENSE and third_party/hnswlib/VENDOR.txt.
+#include <hnswlib/hnswlib.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -40,6 +44,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -220,6 +225,125 @@ bench_knn_brute(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
     return summarize(std::move(samples_ns), queries.size());
 }
 
+// kNN brute-force baseline, multi-threaded. Splits the query set across
+// hardware concurrency. The honest threaded reference for a real-world
+// "is your fancy index worth it" comparison.
+[[nodiscard]] static Stats
+bench_knn_brute_parallel(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+                         std::size_t k, int repeats, unsigned nthreads)
+{
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    std::vector<double> per_query_sums(queries.size(), 0.0);
+    euclid m;
+
+    auto worker = [&](std::size_t q0, std::size_t q1) {
+        std::vector<std::pair<double, std::uint32_t>> heap;
+        heap.reserve(db.size());
+        for (std::size_t q = q0; q < q1; ++q) {
+            heap.clear();
+            const auto &qv = queries[q];
+            for (std::uint32_t i = 0; i < db.size(); ++i)
+                heap.emplace_back(m(qv, db[i]), i);
+            std::partial_sort(heap.begin(),
+                              heap.begin() + std::min<std::size_t>(k, heap.size()),
+                              heap.end());
+            double acc = 0.0;
+            for (std::size_t i = 0; i < std::min<std::size_t>(k, heap.size()); ++i)
+                acc += heap[i].first;
+            per_query_sums[q] = acc;
+        }
+    };
+
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            std::vector<std::thread> ts;
+            ts.reserve(nthreads);
+            const std::size_t Q = queries.size();
+            const std::size_t chunk = (Q + nthreads - 1) / nthreads;
+            for (unsigned t = 0; t < nthreads; ++t) {
+                const std::size_t q0 = t * chunk;
+                const std::size_t q1 = std::min(q0 + chunk, Q);
+                if (q0 < q1) ts.emplace_back(worker, q0, q1);
+            }
+            for (auto &t : ts) t.join();
+        });
+        samples_ns.push_back(ns);
+    }
+    volatile double sink = 0.0;
+    for (double v : per_query_sums) sink += v;
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
+// HNSW (approximate) baseline via vendored hnswlib. Returns throughput and
+// fills `recall_out` with the recall@k against brute-force ground truth.
+[[nodiscard]] static Stats
+bench_knn_hnsw(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+               std::size_t k, int repeats,
+               std::size_t M, std::size_t ef_construction, std::size_t ef_search,
+               double &recall_out)
+{
+    // hnswlib's L2Space expects a flat float buffer.
+    std::vector<float> flat(db.size() * kD);
+    for (std::size_t i = 0; i < db.size(); ++i)
+        for (std::size_t j = 0; j < kD; ++j)
+            flat[i * kD + j] = static_cast<float>(db[i][j]);
+
+    hnswlib::L2Space space(kD);
+    hnswlib::HierarchicalNSW<float> index(&space, db.size(), M, ef_construction);
+    for (std::size_t i = 0; i < db.size(); ++i)
+        index.addPoint(flat.data() + i * kD, static_cast<hnswlib::labeltype>(i));
+    index.setEf(ef_search);
+
+    std::vector<float> qflat(queries.size() * kD);
+    for (std::size_t i = 0; i < queries.size(); ++i)
+        for (std::size_t j = 0; j < kD; ++j)
+            qflat[i * kD + j] = static_cast<float>(queries[i][j]);
+
+    // Ground truth ids for recall calculation (brute force).
+    std::vector<std::vector<std::uint32_t>> gt(queries.size());
+    {
+        euclid m;
+        for (std::size_t q = 0; q < queries.size(); ++q) {
+            std::vector<std::pair<double, std::uint32_t>> heap;
+            heap.reserve(db.size());
+            for (std::uint32_t i = 0; i < db.size(); ++i)
+                heap.emplace_back(m(queries[q], db[i]), i);
+            std::partial_sort(heap.begin(), heap.begin() + std::min<std::size_t>(k, heap.size()), heap.end());
+            for (std::size_t i = 0; i < std::min<std::size_t>(k, heap.size()); ++i)
+                gt[q].push_back(heap[i].second);
+        }
+    }
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    std::size_t total_hits = 0;
+    std::size_t total_expected = 0;
+
+    for (int r = 0; r < repeats; ++r) {
+        std::size_t hits_this_run = 0;
+        const double ns = time_ns([&] {
+            for (std::size_t q = 0; q < queries.size(); ++q) {
+                auto res = index.searchKnn(qflat.data() + q * kD, k);
+                if (r == 0) {
+                    std::vector<std::uint32_t> got;
+                    while (!res.empty()) { got.push_back(static_cast<std::uint32_t>(res.top().second)); res.pop(); }
+                    for (auto id : gt[q])
+                        if (std::find(got.begin(), got.end(), id) != got.end()) ++hits_this_run;
+                }
+            }
+        });
+        samples_ns.push_back(ns);
+        if (r == 0) {
+            total_hits += hits_this_run;
+            for (auto &g : gt) total_expected += g.size();
+        }
+    }
+    recall_out = total_expected ? static_cast<double>(total_hits) / static_cast<double>(total_expected) : 0.0;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
 // Range search (LC), radius chosen so each query returns roughly `target_count` neighbors.
 [[nodiscard]] static Stats
 bench_range(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
@@ -391,7 +515,22 @@ int main(int argc, char **argv)
 
     // 3. kNN throughput (brute force baseline). Brute force has no build phase.
     const Stats s_knn_bf = bench_knn_brute(db, queries, k, /*repeats=*/3);
-    print_row("knn k=10 (brute force)", Q, s_knn_bf);
+    print_row("knn k=10 (brute force, 1T)", Q, s_knn_bf);
+
+    // 3b. Multi-threaded brute force. The real-world baseline once threads
+    //     are on the table.
+    const unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
+    const Stats s_knn_bf_par = bench_knn_brute_parallel(db, queries, k, /*repeats=*/3, nthreads);
+    char lbl[64];
+    std::snprintf(lbl, sizeof lbl, "knn k=10 (brute force, %uT)", nthreads);
+    print_row(lbl, Q, s_knn_bf_par);
+
+    // 3c. HNSW approximate baseline. Reports throughput AND recall@k so the
+    //     speed/recall tradeoff is on the page.
+    double hnsw_recall = 0.0;
+    const Stats s_knn_hnsw = bench_knn_hnsw(db, queries, k, /*repeats=*/3,
+        /*M=*/16, /*ef_construction=*/200, /*ef_search=*/50, hnsw_recall);
+    print_row("knn k=10 (HNSW, approx)", Q, s_knn_hnsw);
 
     // 4. Range search (LC). Radius picked to yield ~5-15 results on uniform data.
     const double radius = 0.4;
@@ -408,10 +547,13 @@ int main(int argc, char **argv)
     // and the break-even query count.
     const double build_total_us  = (s_insert.per_op_ns * static_cast<double>(N)) / 1000.0;
     const double saved_per_q_us  = (s_knn_bf.per_op_ns - s_knn_lc.per_op_ns) / 1000.0;
-    std::printf("\nbuild amortization (kNN):\n");
+    std::printf("\nbuild amortization (kNN, LC vs single-thread brute):\n");
     std::printf("  one-time build:        %12.1f us  (insert * N)\n", build_total_us);
-    std::printf("  per-query brute:       %12.3f us\n", s_knn_bf.per_op_ns / 1000.0);
+    std::printf("  per-query brute (1T):  %12.3f us\n", s_knn_bf.per_op_ns / 1000.0);
+    std::printf("  per-query brute (%uT): %12.3f us\n", nthreads, s_knn_bf_par.per_op_ns / 1000.0);
     std::printf("  per-query LC:          %12.3f us\n", s_knn_lc.per_op_ns / 1000.0);
+    std::printf("  per-query HNSW (approx): %10.3f us  (recall@%zu = %.3f)\n",
+                s_knn_hnsw.per_op_ns / 1000.0, k, hnsw_recall);
     if (saved_per_q_us > 0.0) {
         const double breakeven = build_total_us / saved_per_q_us;
         std::printf("  LC saves per query:    %12.3f us\n", saved_per_q_us);
