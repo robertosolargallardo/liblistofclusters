@@ -26,7 +26,9 @@ class internal_object
 private:
     uint32_t _id{0U};
     object_t _object{};
-    double   _distance{0.0};
+    double   _distance{0.0};        // d(centroid, this)
+    double   _pivot_distance{0.0};  // d(cluster_pivot, this); only meaningful
+                                    // when the owning cluster has set a pivot
     bool     _ghost{true};
 
 public:
@@ -43,9 +45,11 @@ public:
     [[nodiscard]] uint32_t id(void) const noexcept { return this->_id; }
     [[nodiscard]] const object_t& object(void) const noexcept { return this->_object; }
     [[nodiscard]] double distance(void) const noexcept { return this->_distance; }
+    [[nodiscard]] double pivot_distance(void) const noexcept { return this->_pivot_distance; }
     [[nodiscard]] bool ghost(void) const noexcept { return this->_ghost; }
 
     void distance(const double &_d) noexcept { this->_distance = _d; }
+    void pivot_distance(const double &_d) noexcept { this->_pivot_distance = _d; }
     void ghost(const bool &_g) noexcept { this->_ghost = _g; }
 };
 }

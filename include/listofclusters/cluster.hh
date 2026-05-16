@@ -23,6 +23,15 @@ private:
     bucket_t           _bucket{};
     double             _radius{0.0};
 
+    // Optional second reference point ("pivot") for tighter triangle-inequality
+    // pruning. When set, every bucket member also has a precomputed
+    // pivot_distance = d(pivot, member). Both d(query, centroid) AND
+    // d(query, pivot) bounds are then checked at search time, multiplying
+    // pruning power. Bulk_build sets the pivot to the bucket member farthest
+    // from the centroid; incremental insert leaves it unset (_pivot.ghost()
+    // remains true).
+    internal_object_t  _pivot{};
+
 
 public:
     cluster(void) = default;
@@ -40,6 +49,22 @@ public:
 
     [[nodiscard]] const internal_object_t& centroid(void) const noexcept { return _centroid; }
     [[nodiscard]] const bucket_t& bucket(void) const noexcept { return _bucket; }
+
+    // Optional second reference point; query-time pruning uses it when has_pivot().
+    [[nodiscard]] const internal_object_t& pivot(void) const noexcept { return _pivot; }
+    [[nodiscard]] bool has_pivot(void) const noexcept { return !_pivot.ghost(); }
+
+    // Caller computes d(new_pivot, member) for each existing bucket member and
+    // passes them in - the cluster only stores. Called by bulk_build.
+    void set_pivot(internal_object_t _p, const std::vector<double> &_pivot_dists)
+    {
+        _pivot = std::move(_p);
+        _pivot.ghost(false);
+        // _pivot_dists is parallel to _bucket; cluster.insert preserves the
+        // sort order of _bucket so a vector index suffices.
+        for (std::size_t i = 0; i < _bucket.size() && i < _pivot_dists.size(); ++i)
+            _bucket[i].pivot_distance(_pivot_dists[i]);
+    }
 
     [[nodiscard]] size_t bucket_count(void) const noexcept { return _bucket.size(); }
 
@@ -106,6 +131,7 @@ void cluster<object_t>::clear(void)
     this->_radius = 0.0;
     this->_bucket.clear();
     this->_centroid.ghost(true);
+    this->_pivot.ghost(true);
 }
 
 template<class object_t>

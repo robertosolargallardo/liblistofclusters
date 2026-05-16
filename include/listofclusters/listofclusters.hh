@@ -71,9 +71,19 @@ public:
     // pruning fires more often at query time. Trades build time for query
     // time, as the paper intends.
     //
+    // `use_pivots`: when true, additionally chooses a second reference point
+    // (the bucket member farthest from the centroid) per cluster and stores
+    // d(pivot, member) for every bucket member. At search time both bounds
+    // are used for triangle-inequality pruning. The extra `d(query, pivot)`
+    // distance call per cluster pays for itself only when the per-distance
+    // cost is high (high D, expensive metric). For cheap metrics in low D
+    // (Euclidean on small float vectors) it tends to be a slight net loss,
+    // so the default is false.
+    //
     // Replaces any existing index state (clear() is called first).
     void bulk_build(const std::vector<object_t> &objs,
-                    const std::vector<uint32_t> &ids);
+                    const std::vector<uint32_t> &ids,
+                    bool use_pivots = false);
 
     // Queries are read-only with respect to the index: they only touch _list
     // and the (stateless) metric. Multiple knn_search/range_search/batch_knn
@@ -227,7 +237,8 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
     const std::vector<object_t> &objs,
-    const std::vector<uint32_t> &ids)
+    const std::vector<uint32_t> &ids,
+    bool use_pivots)
 {
     this->clear();
     const std::size_t n = std::min(objs.size(), ids.size());
@@ -283,6 +294,31 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
                     assigned[idx] = 1;
                 }
             remaining -= take;
+
+            // 5. Optional pivot for tighter triangle-inequality pruning at
+            //    query time. The farthest bucket member from the centroid
+            //    maximizes the "lever arm" of the pivot bound. Compute
+            //    d(pivot, m) for every OTHER bucket member and stash on the
+            //    cluster. Opt-in via `use_pivots` because at low D / cheap
+            //    metrics the extra d(query, pivot) per cluster outweighs
+            //    the savings.
+            if (use_pivots && take >= 2) {
+                const std::size_t pivot_idx_in_scratch = take - 1;
+                const std::size_t pivot_obj_idx = scratch[pivot_idx_in_scratch].second;
+                std::vector<double> pivot_dists;
+                pivot_dists.reserve(take);
+                for (std::size_t i = 0; i < take; ++i) {
+                    const std::size_t mem_obj_idx = scratch[i].second;
+                    if (mem_obj_idx == pivot_obj_idx)
+                        pivot_dists.push_back(0.0);
+                    else
+                        pivot_dists.push_back(this->_metric(objs[pivot_obj_idx], objs[mem_obj_idx]));
+                }
+                cluster.set_pivot(
+                    internal_object_t(objs[pivot_obj_idx], ids[pivot_obj_idx]),
+                    pivot_dists);
+            }
+
             this->_list.push_back(std::move(cluster));
         }
 }
@@ -320,16 +356,31 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
                     if(d <= _radius && !cc.ghost() && cc.id() != qid)
                         _results.push(cc.object(), cc.id(), d);
 
+                    // If the cluster has a pivot, defer d(q, pivot) until at
+                    // least one bucket member clears the centroid bound; for
+                    // clusters that the centroid bound prunes wholesale, we
+                    // never pay the pivot distance call.
+                    const bool use_pivot = c.has_pivot();
+                    bool dp_set = false;
+                    double dp = 0.0;
+
                     for(const auto &o : c.bucket())
                         {
-                            // Triangle-inequality prune (uses precomputed
-                            // o.distance() = d(centroid, o), no metric call)
-                            if((d - _radius) <= o.distance() && (d + _radius) >= o.distance())
-                                {
-                                    const double md = this->_metric(q, o.object());
-                                    if(md <= _radius && o.id() != qid)
-                                        _results.push(o.object(), o.id(), md);
+                            // Centroid bound (always available).
+                            if((d - _radius) > o.distance() || (d + _radius) < o.distance())
+                                continue;
+                            if (use_pivot) {
+                                if (!dp_set) {
+                                    dp = this->_metric(q, c.pivot().object());
+                                    dp_set = true;
                                 }
+                                const double pd = o.pivot_distance();
+                                if((dp - _radius) > pd || (dp + _radius) < pd)
+                                    continue;
+                            }
+                            const double md = this->_metric(q, o.object());
+                            if(md <= _radius && o.id() != qid)
+                                _results.push(o.object(), o.id(), md);
                         }
                 }
             if((d + _radius) <= c.radius())
@@ -351,14 +402,26 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::explore(resultsli
     if(dqc <= _radius && !cc.ghost() && cc.id() != qid)
         _results.push(cc.object(), cc.id(), dqc);
 
+    const bool use_pivot = _cluster.has_pivot();
+    bool dqp_set = false;
+    double dqp = 0.0;
+
     for(const auto &o : _cluster.bucket())
         {
-            if((dqc - _radius) <= o.distance() && (dqc + _radius) >= o.distance())
-                {
-                    const double d = this->_metric(q, o.object());
-                    if(d <= _radius && o.id() != qid)
-                        _results.push(o.object(), o.id(), d);
+            if((dqc - _radius) > o.distance() || (dqc + _radius) < o.distance())
+                continue;
+            if (use_pivot) {
+                if (!dqp_set) {
+                    dqp = this->_metric(q, _cluster.pivot().object());
+                    dqp_set = true;
                 }
+                const double pd = o.pivot_distance();
+                if((dqp - _radius) > pd || (dqp + _radius) < pd)
+                    continue;
+            }
+            const double d = this->_metric(q, o.object());
+            if(d <= _radius && o.id() != qid)
+                _results.push(o.object(), o.id(), d);
         }
 }
 
@@ -404,17 +467,32 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
             // 2. Explore bucket if the query ball intersects this cluster.
             if ((d - radius) <= c.radius())
                 {
+                    // Defer d(q, pivot) until a bucket member clears the
+                    // centroid bound; for clusters the centroid prune kills
+                    // wholesale, the pivot distance call is skipped.
+                    const bool use_pivot = c.has_pivot();
+                    bool dp_set = false;
+                    double dp = 0.0;
+
                     for (const auto &m : c.bucket())
                         {
-                            // Triangle-inequality prune (cheap, no metric call).
-                            if ((d - radius) <= m.distance() && (d + radius) >= m.distance())
+                            // Centroid triangle-inequality bound.
+                            if ((d - radius) > m.distance() || (d + radius) < m.distance())
+                                continue;
+                            if (use_pivot) {
+                                if (!dp_set) {
+                                    dp = this->_metric(q, c.pivot().object());
+                                    dp_set = true;
+                                }
+                                const double pd = m.pivot_distance();
+                                if ((dp - radius) > pd || (dp + radius) < pd)
+                                    continue;
+                            }
+                            const double md = this->_metric(q, m.object());
+                            if (md < radius && m.id() != qid)
                                 {
-                                    const double md = this->_metric(q, m.object());
-                                    if (md < radius && m.id() != qid)
-                                        {
-                                            results.push(m.object(), m.id(), md);
-                                            refresh_radius();
-                                        }
+                                    results.push(m.object(), m.id(), md);
+                                    refresh_radius();
                                 }
                         }
                 }
