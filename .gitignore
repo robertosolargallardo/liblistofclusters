@@ -34,3 +34,4 @@ __pycache__/
 *.swp
 tests/test_smoke_nosan
 bench/bench_main
+bench/compare.csv
