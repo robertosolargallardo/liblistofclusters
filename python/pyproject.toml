@@ -1,0 +1,24 @@
+[build-system]
+requires = ["scikit-build-core >= 0.10", "nanobind >= 2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "listofclusters"
+version = "0.1.0"
+description = "Python bindings for liblistofclusters - exact metric-space nearest-neighbor index"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Roberto Solar"}]
+license = {text = "GPL-3.0"}
+dependencies = ["numpy >= 1.20"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+cmake.build-type = "Release"
+wheel.packages = ["listofclusters"]
+# Build the abi3 stable interface against the lowest supported Python.
+wheel.py-api = "cp311"
+
+[tool.scikit-build.cmake.define]
+CMAKE_CXX_STANDARD = "23"
