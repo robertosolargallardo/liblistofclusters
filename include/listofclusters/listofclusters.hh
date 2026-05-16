@@ -34,7 +34,6 @@ public:
 private:
     list_t     _list;
     uint32_t   _cid{0U};
-    std::map<uint32_t,std::map<uint32_t,double>> _dcache;
     [[no_unique_address]] distance_t _metric{};
 
 public:
@@ -137,7 +136,6 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::clear(void) noexcept
 {
     this->_list.clear();
-    this->_dcache.clear();
     this->_cid = 0U;
 }
 
@@ -151,7 +149,6 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(const obj
 {
     resultslist_t results(internal_object_t(_object, _id));
     this->range_search(results, _radius);
-    this->_dcache.erase(_id);
     return results;
 }
 
@@ -223,7 +220,6 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
         }
     while(results.results().size() < _k);
 
-    this->_dcache.erase(_id);
     return results;
 }
 
@@ -231,11 +227,12 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 double listofclusters<object_t,distance_t,bucket_size,overflow>::internal_distance(const internal_object_t &_a, const internal_object_t &_b)
 {
-    auto &inner = this->_dcache[_a.id()];
-    auto it = inner.find(_b.id());
-    if(it == inner.end())
-        it = inner.emplace(_b.id(), this->_metric(_a.object(), _b.object())).first;
-    return it->second;
+    // Direct call. Earlier code memoized via a nested
+    // std::map<uint32_t, std::map<uint32_t, double>>, but benchmarking
+    // showed it had no measurable impact on kNN throughput (each query
+    // touches each centroid at most a couple of times, so the map lookup
+    // overhead canceled out the savings). Removed in the same commit.
+    return this->_metric(_a.object(), _b.object());
 }
 
 }  // namespace metric
