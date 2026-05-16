@@ -50,8 +50,23 @@ public:
     void remove(const object_t&, const uint32_t&);
     void clear(void) noexcept;
 
-    [[nodiscard]] resultslist_t knn_search(const object_t&, const uint32_t&, const size_t&);
-    [[nodiscard]] resultslist_t range_search(const object_t&, const uint32_t&, const double&);
+    // Queries are read-only with respect to the index: they only touch _list
+    // and the (stateless) metric. Multiple knn_search/range_search/batch_knn
+    // calls on the same index are safe to run concurrently. Concurrent
+    // insert/remove with queries IS NOT SAFE - the index is not lock-free.
+    [[nodiscard]] resultslist_t knn_search(const object_t&, const uint32_t&, const size_t&) const;
+    [[nodiscard]] resultslist_t range_search(const object_t&, const uint32_t&, const double&) const;
+
+    // Parallel batch kNN. Each query in `queries[i]` is searched with id
+    // `start_qid + i`. Queries are partitioned across `nthreads` worker
+    // threads (default: hardware_concurrency). Returns one resultslist per
+    // input query, in input order. Thread setup happens inside the call;
+    // for fine-grained batches the caller should reuse threads externally.
+    [[nodiscard]] std::vector<resultslist_t>
+    batch_knn(const std::vector<object_t> &queries,
+              std::uint32_t start_qid,
+              std::size_t k,
+              unsigned nthreads = 0) const;
 
     [[nodiscard]] size_t size(void) const noexcept { return _list.size(); }
     [[nodiscard]] bool empty(void) const noexcept { return _list.empty(); }
@@ -63,8 +78,8 @@ public:
     }
 
 private:
-    void range_search(resultslist_t&, const double&);
-    void explore(resultslist_t&, const cluster_t&, const double&);
+    void range_search(resultslist_t&, const double&) const;
+    void explore(resultslist_t&, const cluster_t&, const double&) const;
 
     static_assert(overflow >= bucket_size,
                   "overflow must be >= bucket_size (legacy invariant)");
@@ -144,7 +159,7 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::clear(void) noexc
 template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 typename listofclusters<object_t,distance_t,bucket_size,overflow>::resultslist_t
-listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(const object_t &_object, const uint32_t &_id, const double &_radius)
+listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(const object_t &_object, const uint32_t &_id, const double &_radius) const
 {
     resultslist_t results(internal_object_t(_object, _id));
     this->range_search(results, _radius);
@@ -153,7 +168,7 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(const obj
 
 template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
-void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resultslist_t &_results, const double &_radius)
+void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resultslist_t &_results, const double &_radius) const
 {
     // Hoist query object out of the resultslist getter so each iteration
     // does not chase the centroid()/.object() chain.
@@ -192,7 +207,7 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
 // inlined logic in range_search above.
 template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
-void listofclusters<object_t,distance_t,bucket_size,overflow>::explore(resultslist_t &_results, const cluster_t &_cluster, const double &_radius)
+void listofclusters<object_t,distance_t,bucket_size,overflow>::explore(resultslist_t &_results, const cluster_t &_cluster, const double &_radius) const
 {
     const object_t &q = _results.centroid().object();
     const uint32_t qid = _results.centroid().id();
@@ -226,7 +241,7 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::explore(resultsli
 template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 typename listofclusters<object_t,distance_t,bucket_size,overflow>::resultslist_t
-listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const object_t &_object, const uint32_t &_id, const size_t &_k)
+listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const object_t &_object, const uint32_t &_id, const size_t &_k) const
 {
     resultslist_t results(internal_object_t(_object, _id), _k);
     const object_t &q = _object;
@@ -280,6 +295,56 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
     return results;
 }
 
+// ---------------------------------------------------------------------------
+// batch_knn - parallel kNN across multiple queries
+//
+// The index is read-only during queries (no member state mutates), so we
+// simply partition the query batch across worker threads. Each worker
+// calls knn_search for its assigned queries; results are written to a
+// pre-sized output vector at the input index. No synchronization needed
+// between workers because each thread writes to a disjoint slice.
+// ---------------------------------------------------------------------------
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+std::vector<typename listofclusters<object_t,distance_t,bucket_size,overflow>::resultslist_t>
+listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
+    const std::vector<object_t> &queries,
+    std::uint32_t start_qid,
+    std::size_t k,
+    unsigned nthreads) const
+{
+    std::vector<resultslist_t> results(queries.size());
+    if (queries.empty()) return results;
+
+    if (nthreads == 0)
+        nthreads = std::max(1u, std::thread::hardware_concurrency());
+    if (nthreads > queries.size())
+        nthreads = static_cast<unsigned>(queries.size());
+
+    // Fast path: a single-threaded batch avoids std::thread overhead and
+    // is equivalent to a manual loop of knn_search calls.
+    if (nthreads == 1) {
+        for (std::size_t i = 0; i < queries.size(); ++i)
+            results[i] = this->knn_search(queries[i], start_qid + static_cast<std::uint32_t>(i), k);
+        return results;
+    }
+
+    const std::size_t Q = queries.size();
+    const std::size_t chunk = (Q + nthreads - 1) / nthreads;
+    std::vector<std::thread> ts;
+    ts.reserve(nthreads);
+    for (unsigned t = 0; t < nthreads; ++t) {
+        const std::size_t q0 = t * chunk;
+        const std::size_t q1 = std::min(q0 + chunk, Q);
+        if (q0 >= q1) break;
+        ts.emplace_back([this, &queries, &results, start_qid, k, q0, q1]() {
+            for (std::size_t i = q0; i < q1; ++i)
+                results[i] = this->knn_search(queries[i], start_qid + static_cast<std::uint32_t>(i), k);
+        });
+    }
+    for (auto &t : ts) t.join();
+    return results;
+}
 
 }  // namespace metric
 #endif

@@ -225,6 +225,30 @@ bench_knn_brute(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
     return summarize(std::move(samples_ns), queries.size());
 }
 
+// kNN LC, batched across worker threads via Index::batch_knn.
+[[nodiscard]] static Stats
+bench_knn_lc_parallel(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+                      std::size_t k, int repeats, unsigned nthreads)
+{
+    idx_t<> idx;
+    for (std::uint32_t i = 0; i < db.size(); ++i) idx.insert(db[i], i);
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    volatile std::size_t sink = 0;
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            auto res = idx.batch_knn(queries,
+                                     static_cast<std::uint32_t>(db.size()),
+                                     k, nthreads);
+            for (auto &q : res) sink += q.results().size();
+        });
+        samples_ns.push_back(ns);
+    }
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
 // kNN brute-force baseline, multi-threaded. Splits the query set across
 // hardware concurrency. The honest threaded reference for a real-world
 // "is your fancy index worth it" comparison.
@@ -511,7 +535,16 @@ int main(int argc, char **argv)
 
     // 2. kNN throughput (LC), queries only - excludes build.
     const Stats s_knn_lc = bench_knn(db, queries, k, /*repeats=*/5);
-    print_row("knn k=10 (LC, query only)", Q, s_knn_lc);
+    print_row("knn k=10 (LC, 1T)", Q, s_knn_lc);
+
+    // 2b. kNN throughput (LC) via batch_knn parallelized across hw threads.
+    const unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
+    const Stats s_knn_lc_par = bench_knn_lc_parallel(db, queries, k, /*repeats=*/5, nthreads);
+    {
+        char lbl[64];
+        std::snprintf(lbl, sizeof lbl, "knn k=10 (LC batch, %uT)", nthreads);
+        print_row(lbl, Q, s_knn_lc_par);
+    }
 
     // 3. kNN throughput (brute force baseline). Brute force has no build phase.
     const Stats s_knn_bf = bench_knn_brute(db, queries, k, /*repeats=*/3);
@@ -519,11 +552,12 @@ int main(int argc, char **argv)
 
     // 3b. Multi-threaded brute force. The real-world baseline once threads
     //     are on the table.
-    const unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
     const Stats s_knn_bf_par = bench_knn_brute_parallel(db, queries, k, /*repeats=*/3, nthreads);
-    char lbl[64];
-    std::snprintf(lbl, sizeof lbl, "knn k=10 (brute force, %uT)", nthreads);
-    print_row(lbl, Q, s_knn_bf_par);
+    {
+        char lbl[64];
+        std::snprintf(lbl, sizeof lbl, "knn k=10 (brute force, %uT)", nthreads);
+        print_row(lbl, Q, s_knn_bf_par);
+    }
 
     // 3c. HNSW approximate baseline. Reports throughput AND recall@k so the
     //     speed/recall tradeoff is on the page.

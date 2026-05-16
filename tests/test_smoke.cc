@@ -222,6 +222,46 @@ static void test_knn_matches_brute_force()
               << " queries, N=" << N << " k=" << k << ")\n";
 }
 
+// batch_knn must produce the same answers (one resultslist per query) as
+// calling knn_search in a serial loop. Sanity check for phase 4 threading.
+static void test_batch_knn_matches_serial()
+{
+    idx_t idx;
+    constexpr std::uint32_t N = 200U;
+    constexpr std::size_t D = 6U;
+    constexpr std::size_t k = 5U;
+
+    std::vector<vec_t> db(N);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        idx.insert(db[i], i);
+    }
+
+    constexpr std::size_t Qn = 25;
+    std::vector<vec_t> queries(Qn);
+    for (std::size_t q = 0; q < Qn; ++q) {
+        queries[q].resize(D);
+        for (std::size_t j = 0; j < D; ++j) queries[q][j] = u(rng);
+    }
+
+    auto par = idx.batch_knn(queries, N, k);
+    assert(par.size() == Qn);
+
+    for (std::size_t q = 0; q < Qn; ++q) {
+        auto ser = idx.knn_search(queries[q], static_cast<std::uint32_t>(N + q), k);
+        std::vector<std::uint32_t> par_ids, ser_ids;
+        for (const auto &r : par[q].results())  par_ids.push_back(r.id());
+        for (const auto &r : ser.results())     ser_ids.push_back(r.id());
+        std::sort(par_ids.begin(), par_ids.end());
+        std::sort(ser_ids.begin(), ser_ids.end());
+        assert(par_ids == ser_ids && "batch_knn output differs from serial knn_search");
+    }
+    std::cout << "  test_batch_knn_matches_serial: OK (" << Qn << " queries)\n";
+}
+
 int main()
 {
     std::cout << "liblistofclusters smoke tests:\n";
@@ -230,6 +270,7 @@ int main()
     test_equal_distance_strict_weak_ordering();
     test_large_n_no_crash();
     test_knn_matches_brute_force();
+    test_batch_knn_matches_serial();
     std::cout << "all tests passed\n";
     return 0;
 }
