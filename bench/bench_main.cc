@@ -328,6 +328,344 @@ bench_knn_simd(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
 }
 
 // -----------------------------------------------------------------------------
+// KD-tree (exact NN). Recursive split on the axis of widest spread.
+// Tight bounding boxes per node so the search prunes via per-axis distance.
+// Falls back to brute force at small leaf size (16 here). Classic structure
+// for low-D Euclidean; degrades sharply past ~20 dimensions but a useful
+// reference at our D=8.
+// -----------------------------------------------------------------------------
+struct kdtree_t {
+    struct node {
+        std::size_t axis;
+        double split;
+        std::size_t left, right;       // children (0 = null)
+        std::size_t lo, hi;            // index range in `order` (leaves only)
+        std::array<double, kD> bb_lo, bb_hi;  // bounding box
+    };
+    std::vector<node> nodes;
+    std::vector<std::uint32_t> order;  // permutation of [0, N) sorted into leaves
+    const std::vector<vec_t>* data = nullptr;
+    static constexpr std::size_t kLeafSize = 16;
+
+    [[nodiscard]] std::size_t build_node(std::size_t lo, std::size_t hi)
+    {
+        const std::size_t idx = nodes.size();
+        nodes.emplace_back();
+        node &n = nodes.back();
+        n.lo = lo; n.hi = hi; n.left = 0; n.right = 0;
+
+        // Bounding box.
+        for (std::size_t d = 0; d < kD; ++d) {
+            n.bb_lo[d] = (*data)[order[lo]][d];
+            n.bb_hi[d] = n.bb_lo[d];
+        }
+        for (std::size_t i = lo + 1; i < hi; ++i)
+            for (std::size_t d = 0; d < kD; ++d) {
+                const double v = (*data)[order[i]][d];
+                if (v < n.bb_lo[d]) n.bb_lo[d] = v;
+                if (v > n.bb_hi[d]) n.bb_hi[d] = v;
+            }
+
+        if (hi - lo <= kLeafSize) {
+            n.axis = 0; n.split = 0.0;
+            return idx;
+        }
+
+        // Pick split axis (widest extent), median-of-axis split.
+        std::size_t best_axis = 0;
+        double best_extent = -1.0;
+        for (std::size_t d = 0; d < kD; ++d) {
+            const double ext = n.bb_hi[d] - n.bb_lo[d];
+            if (ext > best_extent) { best_extent = ext; best_axis = d; }
+        }
+        n.axis = best_axis;
+
+        const std::size_t mid = lo + (hi - lo) / 2;
+        std::nth_element(order.begin() + lo, order.begin() + mid, order.begin() + hi,
+            [&](std::uint32_t a, std::uint32_t b) {
+                return (*data)[a][best_axis] < (*data)[b][best_axis];
+            });
+        n.split = (*data)[order[mid]][best_axis];
+
+        const std::size_t left  = build_node(lo, mid);
+        const std::size_t right = build_node(mid, hi);
+        nodes[idx].left  = left;
+        nodes[idx].right = right;
+        return idx;
+    }
+
+    void build(const std::vector<vec_t> &db)
+    {
+        data = &db;
+        order.resize(db.size());
+        std::iota(order.begin(), order.end(), std::uint32_t{0});
+        nodes.clear();
+        nodes.reserve(2 * db.size() / kLeafSize + 1);
+        if (!db.empty()) (void)build_node(0, db.size());
+    }
+
+    // Squared L2 from q to the bounding box of `n`.
+    [[nodiscard]] double bb_dist2(const vec_t &q, const node &n) const noexcept {
+        double s = 0.0;
+        for (std::size_t d = 0; d < kD; ++d) {
+            if (q[d] < n.bb_lo[d])      { const double x = n.bb_lo[d] - q[d]; s += x * x; }
+            else if (q[d] > n.bb_hi[d]) { const double x = q[d] - n.bb_hi[d]; s += x * x; }
+        }
+        return s;
+    }
+
+    void search(std::size_t idx, const vec_t &q,
+                std::size_t k,
+                std::vector<std::pair<double, std::uint32_t>> &heap) const
+    {
+        const node &n = nodes[idx];
+        if (n.left == 0) {  // leaf
+            euclid m;
+            for (std::size_t i = n.lo; i < n.hi; ++i) {
+                const std::uint32_t id = order[i];
+                const double d = m(q, (*data)[id]);
+                if (heap.size() < k) {
+                    heap.emplace_back(d, id);
+                    std::push_heap(heap.begin(), heap.end());
+                } else if (d < heap.front().first) {
+                    std::pop_heap(heap.begin(), heap.end());
+                    heap.back() = {d, id};
+                    std::push_heap(heap.begin(), heap.end());
+                }
+            }
+            return;
+        }
+        // Branch nearer-first for tighter pruning.
+        const std::size_t first  = (q[n.axis] < n.split) ? n.left  : n.right;
+        const std::size_t second = (q[n.axis] < n.split) ? n.right : n.left;
+        search(first, q, k, heap);
+        const node &n2 = nodes[second];
+        const double cur_worst2 = heap.size() < k
+            ? std::numeric_limits<double>::infinity()
+            : heap.front().first * heap.front().first;
+        if (bb_dist2(q, n2) <= cur_worst2)
+            search(second, q, k, heap);
+    }
+
+    [[nodiscard]] std::vector<std::uint32_t> knn(const vec_t &q, std::size_t k) const
+    {
+        std::vector<std::pair<double, std::uint32_t>> heap;
+        heap.reserve(k + 1);
+        if (!nodes.empty()) search(0, q, k, heap);
+        std::sort(heap.begin(), heap.end());
+        std::vector<std::uint32_t> out;
+        out.reserve(heap.size());
+        for (const auto &h : heap) out.push_back(h.second);
+        return out;
+    }
+};
+
+// Ball tree (general metric-space exact NN). Each internal node has a
+// centroid + radius covering all members; pruning uses the triangle
+// inequality d(q, c) - r > tau to skip subtrees. Build splits by the
+// farthest-pair direction (cheap approximation of widest-spread).
+// -----------------------------------------------------------------------------
+struct balltree_t {
+    struct node {
+        vec_t centroid;
+        double radius;
+        std::size_t left, right;
+        std::size_t lo, hi;
+    };
+    std::vector<node> nodes;
+    std::vector<std::uint32_t> order;
+    const std::vector<vec_t>* data = nullptr;
+    static constexpr std::size_t kLeafSize = 16;
+
+    [[nodiscard]] std::size_t build_node(std::size_t lo, std::size_t hi)
+    {
+        const std::size_t idx = nodes.size();
+        nodes.emplace_back();
+        node &n = nodes.back();
+        n.lo = lo; n.hi = hi; n.left = 0; n.right = 0;
+
+        // Centroid = mean of members.
+        for (std::size_t d = 0; d < kD; ++d) n.centroid[d] = 0.0;
+        for (std::size_t i = lo; i < hi; ++i)
+            for (std::size_t d = 0; d < kD; ++d)
+                n.centroid[d] += (*data)[order[i]][d];
+        const double inv = 1.0 / static_cast<double>(hi - lo);
+        for (std::size_t d = 0; d < kD; ++d) n.centroid[d] *= inv;
+
+        // Radius = max distance from centroid to any member.
+        euclid m;
+        double r = 0.0;
+        for (std::size_t i = lo; i < hi; ++i) {
+            const double d = m(n.centroid, (*data)[order[i]]);
+            if (d > r) r = d;
+        }
+        n.radius = r;
+
+        if (hi - lo <= kLeafSize) return idx;
+
+        // Split direction: find the farthest pair (cheap two-pivot heuristic).
+        std::uint32_t a = order[lo];
+        std::size_t i_far_a = lo;
+        double dmax = -1.0;
+        for (std::size_t i = lo; i < hi; ++i) {
+            const double d = m((*data)[a], (*data)[order[i]]);
+            if (d > dmax) { dmax = d; i_far_a = i; }
+        }
+        std::swap(order[lo], order[i_far_a]);
+        std::uint32_t p1 = order[lo];
+
+        std::size_t i_far_b = lo;
+        dmax = -1.0;
+        for (std::size_t i = lo; i < hi; ++i) {
+            const double d = m((*data)[p1], (*data)[order[i]]);
+            if (d > dmax) { dmax = d; i_far_b = i; }
+        }
+        std::swap(order[lo + 1], order[i_far_b]);
+        std::uint32_t p2 = order[lo + 1];
+
+        // Project onto the (p1, p2) axis; split at the median projection.
+        std::vector<std::pair<double, std::uint32_t>> proj;
+        proj.reserve(hi - lo);
+        for (std::size_t i = lo; i < hi; ++i) {
+            // Use distance to p1 as the sort key.
+            const double dp1 = m((*data)[order[i]], (*data)[p1]);
+            proj.emplace_back(dp1, order[i]);
+        }
+        std::sort(proj.begin(), proj.end());
+        const std::size_t mid = (hi - lo) / 2;
+        for (std::size_t i = 0; i < proj.size(); ++i)
+            order[lo + i] = proj[i].second;
+        (void)p2;
+
+        const std::size_t left  = build_node(lo, lo + mid);
+        const std::size_t right = build_node(lo + mid, hi);
+        nodes[idx].left  = left;
+        nodes[idx].right = right;
+        return idx;
+    }
+
+    void build(const std::vector<vec_t> &db)
+    {
+        data = &db;
+        order.resize(db.size());
+        std::iota(order.begin(), order.end(), std::uint32_t{0});
+        nodes.clear();
+        nodes.reserve(2 * db.size() / kLeafSize + 1);
+        if (!db.empty()) (void)build_node(0, db.size());
+    }
+
+    void search(std::size_t idx, const vec_t &q, std::size_t k,
+                std::vector<std::pair<double, std::uint32_t>> &heap) const
+    {
+        euclid m;
+        const node &n = nodes[idx];
+
+        // Triangle-inequality prune at the subtree level.
+        const double d_qc = m(q, n.centroid);
+        const double cur_worst = heap.size() < k
+            ? std::numeric_limits<double>::infinity()
+            : heap.front().first;
+        if (d_qc - n.radius > cur_worst) return;
+
+        if (n.left == 0) {  // leaf
+            for (std::size_t i = n.lo; i < n.hi; ++i) {
+                const std::uint32_t id = order[i];
+                const double d = m(q, (*data)[id]);
+                if (heap.size() < k) {
+                    heap.emplace_back(d, id);
+                    std::push_heap(heap.begin(), heap.end());
+                } else if (d < heap.front().first) {
+                    std::pop_heap(heap.begin(), heap.end());
+                    heap.back() = {d, id};
+                    std::push_heap(heap.begin(), heap.end());
+                }
+            }
+            return;
+        }
+        // Visit nearer child first.
+        const double d_l = m(q, nodes[n.left].centroid);
+        const double d_r = m(q, nodes[n.right].centroid);
+        if (d_l < d_r) {
+            search(n.left,  q, k, heap);
+            search(n.right, q, k, heap);
+        } else {
+            search(n.right, q, k, heap);
+            search(n.left,  q, k, heap);
+        }
+    }
+
+    [[nodiscard]] std::vector<std::uint32_t> knn(const vec_t &q, std::size_t k) const
+    {
+        std::vector<std::pair<double, std::uint32_t>> heap;
+        heap.reserve(k + 1);
+        if (!nodes.empty()) search(0, q, k, heap);
+        std::sort(heap.begin(), heap.end());
+        std::vector<std::uint32_t> out;
+        out.reserve(heap.size());
+        for (const auto &h : heap) out.push_back(h.second);
+        return out;
+    }
+};
+
+// Common helper: brute-force ground truth for one query.
+[[nodiscard]] static std::vector<std::uint32_t>
+ground_truth(const std::vector<vec_t> &db, const vec_t &q, std::size_t k)
+{
+    euclid m;
+    std::vector<std::pair<double, std::uint32_t>> bf;
+    bf.reserve(db.size());
+    for (std::uint32_t i = 0; i < db.size(); ++i)
+        bf.emplace_back(m(q, db[i]), i);
+    std::partial_sort(bf.begin(), bf.begin() + std::min<std::size_t>(k, bf.size()), bf.end());
+    std::vector<std::uint32_t> out;
+    out.reserve(std::min<std::size_t>(k, bf.size()));
+    for (std::size_t i = 0; i < std::min<std::size_t>(k, bf.size()); ++i) out.push_back(bf[i].second);
+    return out;
+}
+
+// Generic bench: build a tree-like structure, run queries, report recall.
+template <class Tree>
+[[nodiscard]] static Stats
+bench_knn_tree(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+               std::size_t k, int repeats, double &recall_out)
+{
+    Tree t;
+    t.build(db);
+
+    std::vector<std::vector<std::uint32_t>> gt(queries.size());
+    for (std::size_t i = 0; i < queries.size(); ++i)
+        gt[i] = ground_truth(db, queries[i], k);
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    std::size_t total_hits = 0;
+    std::size_t total_expected = 0;
+    volatile std::size_t sink = 0;
+
+    for (int r = 0; r < repeats; ++r) {
+        std::size_t hits_this_run = 0;
+        const double ns = time_ns([&] {
+            for (std::size_t q = 0; q < queries.size(); ++q) {
+                auto got = t.knn(queries[q], k);
+                sink += got.size();
+                if (r == 0) {
+                    for (auto id : gt[q])
+                        if (std::find(got.begin(), got.end(), id) != got.end()) ++hits_this_run;
+                }
+            }
+        });
+        samples_ns.push_back(ns);
+        if (r == 0) {
+            total_hits = hits_this_run;
+            for (const auto &g : gt) total_expected += g.size();
+        }
+    }
+    (void)sink;
+    recall_out = total_expected ? static_cast<double>(total_hits) / static_cast<double>(total_expected) : 0.0;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
+// -----------------------------------------------------------------------------
 // IVFFlat baseline (a la Faiss IndexIVFFlat, scaled down)
 //
 // Build: sample nlist random db points as centroids, assign each db point to
@@ -814,6 +1152,16 @@ int main(int argc, char **argv)
         /*M=*/16, /*ef_construction=*/200, /*ef_search=*/50, hnsw_recall);
     print_row("knn k=10 (HNSW, approx)", Q, s_knn_hnsw);
 
+    // 3e. KD-tree exact baseline (low-D Euclidean specialist).
+    double kd_recall = 0.0;
+    const Stats s_knn_kd = bench_knn_tree<kdtree_t>(db, queries, k, /*repeats=*/3, kd_recall);
+    print_row("knn k=10 (KD-tree, 1T)", Q, s_knn_kd);
+
+    // 3f. Ball-tree exact baseline (general metric-space, like LC).
+    double bt_recall = 0.0;
+    const Stats s_knn_bt = bench_knn_tree<balltree_t>(db, queries, k, /*repeats=*/3, bt_recall);
+    print_row("knn k=10 (ball tree, 1T)", Q, s_knn_bt);
+
     // 3d. IVFFlat approximate baseline (inverted-file / k-cell). nlist =
     //     sqrt(N) (the Faiss default), nprobe = nlist / 10 (a moderate
     //     speed/recall point on the IVFFlat tradeoff curve).
@@ -852,6 +1200,10 @@ int main(int argc, char **argv)
     std::printf("  per-query LC:          %12.3f us\n", s_knn_lc.per_op_ns / 1000.0);
     std::printf("  per-query HNSW (approx): %10.3f us  (recall@%zu = %.3f)\n",
                 s_knn_hnsw.per_op_ns / 1000.0, k, hnsw_recall);
+    std::printf("  per-query KD-tree:     %12.3f us  (recall@%zu = %.3f)\n",
+                s_knn_kd.per_op_ns / 1000.0, k, kd_recall);
+    std::printf("  per-query ball tree:   %12.3f us  (recall@%zu = %.3f)\n",
+                s_knn_bt.per_op_ns / 1000.0, k, bt_recall);
     std::printf("  per-query IVFFlat:     %12.3f us  (recall@%zu = %.3f, nlist=%zu nprobe=%zu)\n",
                 s_knn_ivf.per_op_ns / 1000.0, k, ivf_recall, ivf_nlist, ivf_nprobe);
     if (saved_per_q_us > 0.0) {
