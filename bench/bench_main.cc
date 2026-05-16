@@ -6,16 +6,27 @@
 // before phase 4 (threading) and phase 5 (perf pass) so wins can be
 // measured against a known reference.
 //
+// Phase 5.2: payload type is std::array<double, BENCH_D> (compile-time
+// fixed dimensionality). With inline storage, each internal_object holds
+// the full vector in place, so iterating a cluster's bucket is a single
+// sequential walk through contiguous memory - no per-element heap pointer
+// chase, which was the dominant cost with the prior std::vector payload.
+//
+// To bench a different D, change BENCH_D and recompile (`make clean`
+// inside bench/ to force the rebuild). The N and Q workload sizes remain
+// runtime CLI args.
+//
 // Usage:
 //   make bench         # build and run
 //   ./bench_main       # run directly
-//   ./bench_main N D   # override default workload size
+//   ./bench_main N D Q gen   # D is checked against BENCH_D
 //
 // What's reported:
 //   - Insert throughput  (LC build cost)
 //   - kNN throughput     (LC vs brute force baseline)
 //   - Range throughput   (LC vs brute force baseline)
 //   - Recall@k vs brute  (sanity check that the LC results match)
+//   - bucket_size sweep
 
 #include <listofclusters/listofclusters.hh>
 
@@ -26,20 +37,25 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <iomanip>
 #include <iostream>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
-using vec_t  = std::vector<double>;
+#ifndef BENCH_D
+#define BENCH_D 8
+#endif
+
+inline constexpr std::size_t kD = BENCH_D;
+using vec_t  = std::array<double, kD>;
 using clock_t_ = std::chrono::steady_clock;
 
 struct euclid {
     [[nodiscard]] double operator()(const vec_t &a, const vec_t &b) const noexcept
     {
         double s = 0.0;
-        for (std::size_t i = 0; i < a.size(); ++i) {
+        for (std::size_t i = 0; i < kD; ++i) {
             const double d = a[i] - b[i];
             s += d * d;
         }
@@ -103,9 +119,9 @@ static void print_row(const std::string &name, std::size_t ops_per_sample, const
 // -----------------------------------------------------------------------------
 
 [[nodiscard]] static std::vector<vec_t>
-make_dataset(std::size_t N, std::size_t D, std::uint32_t seed)
+make_dataset(std::size_t N, std::uint32_t seed)
 {
-    std::vector<vec_t> db(N, vec_t(D));
+    std::vector<vec_t> db(N);
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> u(-1.0, 1.0);
     for (auto &v : db)
@@ -118,20 +134,20 @@ make_dataset(std::size_t N, std::size_t D, std::uint32_t seed)
 // stdev = noise_sigma. Models real-world data with intrinsic dimensionality
 // well below the nominal D - which is where LC's pruning actually pays off.
 [[nodiscard]] static std::vector<vec_t>
-make_clustered_dataset(std::size_t N, std::size_t D, std::size_t n_clusters,
+make_clustered_dataset(std::size_t N, std::size_t n_clusters,
                        double noise_sigma, std::uint32_t seed)
 {
-    std::vector<vec_t> centers(n_clusters, vec_t(D));
+    std::vector<vec_t> centers(n_clusters);
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> u(-1.0, 1.0);
     for (auto &c : centers) for (auto &x : c) x = u(rng);
 
-    std::vector<vec_t> db(N, vec_t(D));
+    std::vector<vec_t> db(N);
     std::uniform_int_distribution<std::size_t> pick(0, n_clusters - 1);
     std::normal_distribution<double> noise(0.0, noise_sigma);
     for (auto &v : db) {
         const auto &c = centers[pick(rng)];
-        for (std::size_t i = 0; i < D; ++i) v[i] = c[i] + noise(rng);
+        for (std::size_t i = 0; i < kD; ++i) v[i] = c[i] + noise(rng);
     }
     return db;
 }
@@ -331,7 +347,7 @@ recall_at_k(const std::vector<vec_t> &db, const std::vector<vec_t> &queries, std
 int main(int argc, char **argv)
 {
     std::size_t N = (argc > 1) ? static_cast<std::size_t>(std::atoll(argv[1])) : 10000;
-    std::size_t D = (argc > 2) ? static_cast<std::size_t>(std::atoll(argv[2])) : 8;
+    std::size_t D_arg = (argc > 2) ? static_cast<std::size_t>(std::atoll(argv[2])) : kD;
     std::size_t Q = (argc > 3) ? static_cast<std::size_t>(std::atoll(argv[3])) : 200;
     std::size_t k = 10;
     // Set GEN=clustered (env var or 4th positional) to use the mixture-of-
@@ -339,8 +355,13 @@ int main(int argc, char **argv)
     // triangle-inequality pruning needs structure to be effective.
     std::string gen = (argc > 4) ? std::string(argv[4]) : std::string(std::getenv("GEN") ? std::getenv("GEN") : "uniform");
 
+    if (D_arg != kD) {
+        std::fprintf(stderr, "warning: D=%zu requested but binary was built with BENCH_D=%zu; recompile with -DBENCH_D=%zu\n",
+                     D_arg, kD, D_arg);
+    }
+
     std::printf("# liblistofclusters microbenchmarks\n");
-    std::printf("#   dataset: N=%zu, D=%zu, gen=%s\n", N, D, gen.c_str());
+    std::printf("#   dataset: N=%zu, D=%zu (compile-time, std::array payload), gen=%s\n", N, kD, gen.c_str());
     std::printf("#   queries: Q=%zu, k=%zu\n", Q, k);
     std::printf("#   index:   bucket_size=20, overflow=80\n");
     std::printf("#\n");
@@ -350,12 +371,12 @@ int main(int argc, char **argv)
         // 64 clusters of ~N/64 points each, gaussian noise tight enough that
         // points within a cluster are clearly closer to each other than to
         // any other cluster (sigma << inter-cluster distance).
-        db      = make_clustered_dataset(N, D, /*n_clusters=*/64, /*sigma=*/0.05, /*seed=*/42);
+        db      = make_clustered_dataset(N, /*n_clusters=*/64, /*sigma=*/0.05, /*seed=*/42);
         // Queries drawn from the SAME distribution - the realistic case.
-        queries = make_clustered_dataset(Q, D, /*n_clusters=*/64, /*sigma=*/0.05, /*seed=*/9999);
+        queries = make_clustered_dataset(Q, /*n_clusters=*/64, /*sigma=*/0.05, /*seed=*/9999);
     } else {
-        db      = make_dataset(N, D, /*seed=*/42);
-        queries = make_dataset(Q, D, /*seed=*/9999);
+        db      = make_dataset(N, /*seed=*/42);
+        queries = make_dataset(Q, /*seed=*/9999);
     }
 
     print_header();
