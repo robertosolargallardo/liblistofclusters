@@ -39,31 +39,14 @@ public:
 
     internal_object(const object_t &_object,const uint32_t &_id,const double &_distance=0.0)
         : _id(_id), _object(_object), _distance(_distance), _ghost(false) {}
-    uint32_t id(void) const
-    {
-        return(this->_id);
-    }
-    object_t object(void) const
-    {
-        return(this->_object);
-    }
-    double distance(void) const
-    {
-        return(this->_distance);
-    }
-    bool ghost(void) const
-    {
-        return(this->_ghost);
-    }
 
-    void distance(const double &_distance)
-    {
-        this->_distance=_distance;
-    }
-    void ghost(const bool &_ghost)
-    {
-        this->_ghost=_ghost;
-    }
+    [[nodiscard]] uint32_t id(void) const noexcept { return this->_id; }
+    [[nodiscard]] const object_t& object(void) const noexcept { return this->_object; }
+    [[nodiscard]] double distance(void) const noexcept { return this->_distance; }
+    [[nodiscard]] bool ghost(void) const noexcept { return this->_ghost; }
+
+    void distance(const double &_d) noexcept { this->_distance = _d; }
+    void ghost(const bool &_g) noexcept { this->_ghost = _g; }
 };
 }
 #endif

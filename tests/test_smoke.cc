@@ -10,19 +10,29 @@
 
 using vec_t = std::vector<double>;
 
-double euclid(vec_t a, vec_t b)
-{
-    double s = 0.0;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        const double d = a[i] - b[i];
-        s += d * d;
+struct euclid {
+    [[nodiscard]] double operator()(const vec_t &a, const vec_t &b) const noexcept
+    {
+        double s = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const double d = a[i] - b[i];
+            s += d * d;
+        }
+        return std::sqrt(s);
     }
-    return std::sqrt(s);
+};
+
+// Brute-force ground truth (used by the correctness test below).
+[[nodiscard]] static double bf_dist(const vec_t &a, const vec_t &b) noexcept
+{
+    return euclid{}(a, b);
 }
+
+using idx_t = metric::listofclusters<vec_t, euclid, 4, 10>;
 
 static void test_build_and_knn()
 {
-    metric::listofclusters<vec_t, euclid, 4, 10> idx;
+    idx_t idx;
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<double> u(-1.0, 1.0);
@@ -45,7 +55,7 @@ static void test_build_and_knn()
 
     std::vector<std::pair<double, std::uint32_t>> brute;
     brute.reserve(N);
-    for (std::uint32_t i = 0; i < N; ++i) brute.emplace_back(euclid(q, db[i]), i);
+    for (std::uint32_t i = 0; i < N; ++i) brute.emplace_back(bf_dist(q, db[i]), i);
     std::sort(brute.begin(), brute.end());
 
     const auto &got = results.results();
@@ -68,7 +78,7 @@ static void test_build_and_knn()
 
 static void test_range_search()
 {
-    metric::listofclusters<vec_t, euclid, 4, 10> idx;
+    idx_t idx;
 
     constexpr std::uint32_t N = 50U;
     constexpr std::size_t D = 4U;
@@ -89,7 +99,7 @@ static void test_range_search()
 
     std::vector<std::uint32_t> brute_ids;
     for (std::uint32_t i = 0; i < N; ++i)
-        if (euclid(q, db[i]) <= r) brute_ids.push_back(i);
+        if (bf_dist(q, db[i]) <= r) brute_ids.push_back(i);
 
     std::vector<std::uint32_t> got_ids;
     for (const auto &x : results.results()) got_ids.push_back(x.id());
@@ -106,7 +116,7 @@ static void test_range_search()
 
 static void test_equal_distance_strict_weak_ordering()
 {
-    metric::listofclusters<vec_t, euclid, 4, 10> idx;
+    idx_t idx;
 
     const vec_t origin = {0.0, 0.0};
     idx.insert(origin, 0U);
@@ -130,7 +140,7 @@ static void test_equal_distance_strict_weak_ordering()
 // inserts are now O(|list|) per element with deterministic termination.
 static void test_large_n_no_crash()
 {
-    metric::listofclusters<vec_t, euclid, 4, 10> idx;
+    idx_t idx;
 
     constexpr std::uint32_t N = 500U;
     constexpr std::size_t D = 8U;
@@ -163,7 +173,7 @@ static void test_large_n_no_crash()
 // contain exactly the k nearest neighbors according to a full O(N) scan.
 static void test_knn_matches_brute_force()
 {
-    metric::listofclusters<vec_t, euclid, 4, 10> idx;
+    idx_t idx;
 
     constexpr std::uint32_t N = 300U;
     constexpr std::size_t D = 6U;
@@ -188,7 +198,7 @@ static void test_knn_matches_brute_force()
         // Brute force ground truth.
         std::vector<std::pair<double, std::uint32_t>> bf;
         bf.reserve(N);
-        for (std::uint32_t i = 0; i < N; ++i) bf.emplace_back(euclid(query, db[i]), i);
+        for (std::uint32_t i = 0; i < N; ++i) bf.emplace_back(bf_dist(query, db[i]), i);
         std::sort(bf.begin(), bf.end());
 
         std::vector<std::uint32_t> expected;

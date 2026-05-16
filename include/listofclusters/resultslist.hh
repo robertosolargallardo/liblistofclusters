@@ -13,75 +13,32 @@ public:
     typedef std::set<internal_object_t,compare<internal_object_t>> results_t;
 
 private:
-    internal_object_t 			_centroid;
-    results_t        				_results;
-    size_t                    	_k;
+    internal_object_t _centroid{};
+    results_t         _results{};
+    size_t            _k{std::numeric_limits<size_t>::max()};
 
 public:
-    resultslist(void);
-    resultslist(const resultslist&);
-    resultslist(const internal_object_t&,const size_t&);
-    resultslist(const internal_object_t&);
-    resultslist& operator=(const resultslist&);
-    ~resultslist(void);
+    resultslist(void) = default;
+    resultslist(const resultslist&) = default;
+    resultslist(resultslist&&) noexcept = default;
+    resultslist& operator=(const resultslist&) = default;
+    resultslist& operator=(resultslist&&) noexcept = default;
+    ~resultslist(void) = default;
 
-    internal_object_t centroid(void) const;
+    explicit resultslist(const internal_object_t &_c) : _centroid(_c) {}
+    resultslist(const internal_object_t &_c, const size_t &_kk) : _centroid(_c), _k(_kk) {}
 
-    void push(const object_t&,const uint32_t&,const double&);
-    results_t results(void)
+    [[nodiscard]] const internal_object_t& centroid(void) const noexcept { return _centroid; }
+    [[nodiscard]] const results_t& results(void) const noexcept { return _results; }
+    [[nodiscard]] size_t size(void) const noexcept { return _results.size(); }
+
+    void push(const object_t &_object, const uint32_t &_id, const double &_distance)
     {
-        return(this->_results);
+        this->_results.emplace(_object, _id, _distance);
+        if(this->_results.size() > this->_k)
+            this->_results.erase(std::prev(this->_results.end()));
     }
 };
-template<class object_t>
-resultslist<object_t>::resultslist(void)
-{
-    this->_k=std::numeric_limits<size_t>::max();
-}
-template<class object_t>
-resultslist<object_t>::resultslist(const internal_object_t &_centroid)
-{
-    this->_centroid=_centroid;
-    this->_k=std::numeric_limits<size_t>::max();
-}
-template<class object_t>
-resultslist<object_t>::resultslist(const internal_object_t &_centroid,const size_t &_k)
-{
-    this->_centroid=_centroid;
-    this->_k=_k;
-}
-template<class object_t>
-resultslist<object_t>::resultslist(const resultslist &_results)
-{
-    this->_centroid=_results._centroid;
-    this->_results=_results._results;
-    this->_k=_results._k;
-}
-template<class object_t>
-resultslist<object_t>& resultslist<object_t>::operator=(const resultslist &_results)
-{
-    this->_centroid=_results._centroid;
-    this->_results=_results._results;
-    this->_k=_results._k;
-    return(*this);
-}
-template<class object_t>
-resultslist<object_t>::~resultslist(void)
-{
-    this->_results.clear();
-}
-template<class object_t>
-typename resultslist<object_t>::internal_object_t resultslist<object_t>::centroid(void) const
-{
-    return(this->_centroid);
-}
-template<class object_t>
-void resultslist<object_t>::push(const object_t &_object,const uint32_t &_id,const double &_distance)
-{
-    this->_results.insert(internal_object_t(_object,_id,_distance));
 
-    if(this->_results.size()>this->_k)
-        this->_results.erase(--this->_results.end());
-}
-};
+}  // namespace metric
 #endif

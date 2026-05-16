@@ -32,3 +32,4 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+tests/test_smoke_nosan

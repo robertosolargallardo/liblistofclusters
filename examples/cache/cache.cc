@@ -5,7 +5,7 @@
 #include <random>
 #include <chrono>
 #include <memory>
-#include <math.h>
+#include <cmath>
 
 #define IS_K 10
 #define CS_K 5
@@ -13,16 +13,19 @@
 
 typedef arma::rowvec sift_t;
 
-double idistance(sift_t a,sift_t b)
-{
-    sift_t c=a-b;
-    return(sqrt(arma::dot(c,c)));
-}
-double cdistance(metric::resultslist<sift_t> a,metric::resultslist<sift_t> b)
-{
-    sift_t c=a.centroid().object()-b.centroid().object();
-    return(sqrt(arma::dot(c,c)));
-}
+struct idistance {
+    [[nodiscard]] double operator()(const sift_t &a, const sift_t &b) const noexcept {
+        const sift_t c = a - b;
+        return std::sqrt(arma::dot(c, c));
+    }
+};
+struct cdistance {
+    [[nodiscard]] double operator()(const metric::resultslist<sift_t> &a,
+                                    const metric::resultslist<sift_t> &b) const noexcept {
+        const sift_t c = a.centroid().object() - b.centroid().object();
+        return std::sqrt(arma::dot(c, c));
+    }
+};
 
 arma::mat DB;
 
@@ -121,7 +124,7 @@ public:
 
                                 if((dqc-doc)<=radius)
                                     {
-                                        d=idistance(_query,j.object());
+                                        d=idistance{}(_query,j.object());
                                         c.push(j.object(),j.id(),d);
                                         belongs[j.id()]=i.id();//TODO
                                     }

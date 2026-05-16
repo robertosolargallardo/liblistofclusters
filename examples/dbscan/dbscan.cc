@@ -2,18 +2,20 @@
 #include <listofclusters/resultslist.hh>
 #include <armadillo>
 #include <iostream>
+#include <fstream>
 #include <random>
 #include <chrono>
 #include <memory>
-#include <math.h>
+#include <cmath>
 
 typedef arma::rowvec sift_t;
 
-double idistance(sift_t a,sift_t b)
-{
-    sift_t c=a-b;
-    return(sqrt(arma::dot(c,c)));
-}
+struct idistance {
+    [[nodiscard]] double operator()(const sift_t &a, const sift_t &b) const noexcept {
+        const sift_t c = a - b;
+        return std::sqrt(arma::dot(c, c));
+    }
+};
 arma::mat DB;
 
 class dbscan

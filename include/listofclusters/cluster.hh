@@ -32,13 +32,13 @@ public:
 
     void insert(const object_t&,const uint32_t&,const double&);
     void remove(const uint32_t&);
-    bool empty(void);
+    [[nodiscard]] bool empty(void) const noexcept;
 
-    internal_object_t centroid(void) const;
-    bucket_t bucket(void) const;
+    [[nodiscard]] const internal_object_t& centroid(void) const noexcept { return _centroid; }
+    [[nodiscard]] const bucket_t& bucket(void) const noexcept { return _bucket; }
 
     // Direct, non-copying observers needed by the LC insert algorithm.
-    size_t bucket_count(void) const noexcept;
+    [[nodiscard]] size_t bucket_count(void) const noexcept { return _bucket.size(); }
 
     // Remove and return the bucket member with the largest distance to the
     // centroid (the LC "fixed bucket size" overflow case ejects this one
@@ -46,12 +46,12 @@ public:
     // to the new maximum bucket distance (or 0 if the bucket becomes empty).
     internal_object_t pop_farthest(void);
 
-    double radius(void) const;
-    void radius(const double&);
+    [[nodiscard]] double radius(void) const noexcept { return _radius; }
+    void radius(const double &_r) noexcept { _radius = _r; }
 
-    uint32_t id(void) const;
+    [[nodiscard]] uint32_t id(void) const noexcept { return _id; }
 
-    size_t size(void) const;
+    [[nodiscard]] size_t size(void) const noexcept { return (_centroid.ghost() ? 0U : 1U) + _bucket.size(); }
     void clear(void);
 };
 template<class object_t>
@@ -63,70 +63,36 @@ cluster<object_t>::cluster(const uint32_t &_id,const internal_object_t &_centroi
 template<class object_t>
 void cluster<object_t>::insert(const object_t &_object,const uint32_t &_id,const double &_distance)
 {
-    if(_distance>this->_radius)
-        this->_radius=_distance;
-    this->_bucket.insert(internal_object_t(_object,_id,_distance));
-}
-
-template<class object_t>
-typename cluster<object_t>::internal_object_t cluster<object_t>::centroid(void) const
-{
-    return(this->_centroid);
-}
-
-template<class object_t>
-typename cluster<object_t>::bucket_t cluster<object_t>::bucket(void) const
-{
-    return(this->_bucket);
-}
-template<class object_t>
-double cluster<object_t>::radius(void) const
-{
-    return(this->_radius);
-}
-template<class object_t>
-void cluster<object_t>::radius(const double &_radius)
-{
-    this->_radius=_radius;
+    if(_distance > this->_radius)
+        this->_radius = _distance;
+    this->_bucket.emplace(_object, _id, _distance);
 }
 
 template<class object_t>
 void cluster<object_t>::remove(const uint32_t &_id)
 {
-    if(this->_centroid.id()==_id)
+    if(this->_centroid.id() == _id) {
         this->_centroid.ghost(true);
-    else
-        this->_bucket.erase(std::find_if(this->_bucket.begin(),this->_bucket.end(),[&_id](const internal_object_t &_object)->bool{return(_object.id()==_id);}));
+        return;
+    }
+    auto it = std::find_if(this->_bucket.begin(), this->_bucket.end(),
+        [_id](const internal_object_t &o) noexcept { return o.id() == _id; });
+    if(it != this->_bucket.end())
+        this->_bucket.erase(it);
 }
 
 template<class object_t>
-bool cluster<object_t>::empty(void)
+bool cluster<object_t>::empty(void) const noexcept
 {
-    return(this->_centroid.ghost() && this->_bucket.empty());
-}
-template<class object_t>
-uint32_t cluster<object_t>::id(void) const
-{
-    return(this->_id);
+    return this->_centroid.ghost() && this->_bucket.empty();
 }
 
-template<class object_t>
-size_t cluster<object_t>::size(void) const
-{
-    return((this->_centroid.ghost()?0:1)+this->_bucket.size());
-}
 template<class object_t>
 void cluster<object_t>::clear(void)
 {
-    this->_radius=0.0;
+    this->_radius = 0.0;
     this->_bucket.clear();
     this->_centroid.ghost(true);
-}
-
-template<class object_t>
-size_t cluster<object_t>::bucket_count(void) const noexcept
-{
-    return this->_bucket.size();
 }
 
 template<class object_t>
@@ -138,11 +104,11 @@ typename cluster<object_t>::internal_object_t cluster<object_t>::pop_farthest(vo
     auto last = std::prev(this->_bucket.end());
     internal_object_t farthest = *last;
     this->_bucket.erase(last);
-    if (this->_bucket.empty())
-        this->_radius = 0.0;
-    else
-        this->_radius = std::prev(this->_bucket.end())->distance();
+    this->_radius = this->_bucket.empty()
+        ? 0.0
+        : std::prev(this->_bucket.end())->distance();
     return farthest;
 }
-};
+
+}  // namespace metric
 #endif

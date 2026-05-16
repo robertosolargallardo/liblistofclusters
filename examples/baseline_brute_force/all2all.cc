@@ -1,19 +1,16 @@
-#include <listofclusters/listofclusters.hh>
-#include <listofclusters/resultslist.hh>
+// Brute-force O(n^2) pairwise distance baseline. Does not use the LC index;
+// kept for benchmarking and as a sanity-check reference.
 #include <armadillo>
 #include <iostream>
-#include <random>
-#include <chrono>
-#include <memory>
-#include <math.h>
+#include <cmath>
 
 typedef arma::rowvec sift_t;
 arma::mat DB;
 
-double idistance(sift_t a,sift_t b)
+[[nodiscard]] static double idistance(const sift_t &a, const sift_t &b) noexcept
 {
-    sift_t c=a-b;
-    return(sqrt(arma::dot(c,c)));
+    const sift_t c = a - b;
+    return std::sqrt(arma::dot(c, c));
 }
 int main(int argc,char** argv)
 {

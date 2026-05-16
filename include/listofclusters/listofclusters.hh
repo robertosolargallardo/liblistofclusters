@@ -8,15 +8,21 @@
 namespace metric
 {
 
-// Fixed-bucket-size variant of the List of Clusters metric index
+// Fixed-bucket-size List of Clusters metric index
 // (Chavez & Navarro, "A compact space decomposition for effective metric
 // indexing", Pattern Recognition Letters 26, 2005). The structure is a flat
-// list of (center, radius, bucket) triples. The template parameter
-// `bucket_size` is m* in the paper (the target bucket size for fixed-bucket-
-// size construction). `overflow` was used by an earlier incremental scheme
-// (now retired); it is kept in the signature so existing callers don't have
-// to change but is currently unused.
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
+// list of (center, radius, bucket) triples. `bucket_size` is m* in the
+// paper. `overflow` is retained for legacy callers but is unused under the
+// canonical algorithm and asserted >= bucket_size.
+//
+// `distance_t` is any callable satisfying Metric<distance_t, object_t> -
+// typically a stateless functor. Stateless metrics cost no storage thanks
+// to [[no_unique_address]].
+template <class object_t,
+          class distance_t,
+          size_t bucket_size,
+          size_t overflow>
+    requires Metric<distance_t, object_t>
 class listofclusters
 {
 public:
@@ -29,6 +35,7 @@ private:
     list_t     _list;
     uint32_t   _cid{0U};
     std::map<uint32_t,std::map<uint32_t,double>> _dcache;
+    [[no_unique_address]] distance_t _metric{};
 
 public:
     listofclusters(void) = default;
@@ -38,63 +45,60 @@ public:
     listofclusters& operator=(listofclusters&&) noexcept = default;
     ~listofclusters(void) = default;
 
-    void insert(const object_t&,const uint32_t&);
-    void remove(const object_t&,const uint32_t&);
-    void clear(void);
+    explicit listofclusters(distance_t _m) : _metric(std::move(_m)) {}
 
-    resultslist_t knn_search(const object_t&,const uint32_t&,const size_t&);
-    resultslist_t range_search(const object_t&,const uint32_t&,const double&);
+    void insert(const object_t&, const uint32_t&);
+    void remove(const object_t&, const uint32_t&);
+    void clear(void) noexcept;
 
-    void centroids(void) const
+    [[nodiscard]] resultslist_t knn_search(const object_t&, const uint32_t&, const size_t&);
+    [[nodiscard]] resultslist_t range_search(const object_t&, const uint32_t&, const double&);
+
+    [[nodiscard]] size_t size(void) const noexcept { return _list.size(); }
+    [[nodiscard]] bool empty(void) const noexcept { return _list.empty(); }
+
+    void centroids(std::ostream &os = std::cout) const
     {
-        for(const auto& cluster : this->_list)
-            std::cout << cluster.centroid().id() << std::endl;
+        for(const auto& c : this->_list)
+            os << c.centroid().id() << '\n';
     }
 
 private:
-    void range_search(resultslist_t&,const double&);
-    void explore(resultslist_t&,const cluster_t&,const double&);
-    double internal_distance(const internal_object_t&,const internal_object_t&);
+    void range_search(resultslist_t&, const double&);
+    void explore(resultslist_t&, const cluster_t&, const double&);
+    double internal_distance(const internal_object_t&, const internal_object_t&);
 
-    // Suppress -Wunused-template-parameter for `overflow` (kept for API
-    // stability across the C-5/C-6 algorithmic fix).
-    static_assert(overflow >= bucket_size, "overflow must be >= bucket_size (legacy invariant)");
+    static_assert(overflow >= bucket_size,
+                  "overflow must be >= bucket_size (legacy invariant)");
 };
 
 // ---------------------------------------------------------------------------
 // insert
 //
-// Iterative implementation of the LC fixed-bucket-size dynamic insert from
-// section 5.3 of the paper:
-//
-//   "When inserting an element, as soon as we find its appropriate ball i,
-//    the bucket will overflow. Hence we take the element of the bucket
-//    which is farthest from the center c_i, remove it from the bucket
-//    (modifying r_i accordingly), and continue the insertion process in
-//    the tail of the list with the new element."
-//
-// Termination is guaranteed: each iteration either places an element (early
-// return), or advances past a cluster (++it). If we reach _list.end() the
-// element becomes a new cluster appended to the tail.
+// Canonical fixed-bucket-size dynamic insert, Chavez & Navarro 2005 §5.3.
+// Walk the list left-to-right. The first cluster whose ball contains the
+// element absorbs it; if that pushes the bucket over `bucket_size`, eject
+// the bucket member farthest from the centroid (shrinking r_i) and continue
+// inserting *that* element in the tail of the list. Reaching the end of the
+// list without a fit appends the element as a new cluster.
 // ---------------------------------------------------------------------------
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object_t &_object,const uint32_t &_id)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::insert(const object_t &_object, const uint32_t &_id)
 {
     object_t obj = _object;
     uint32_t id  = _id;
 
     for(auto it = this->_list.begin(); it != this->_list.end(); ++it)
         {
-            const double d = distance(obj, it->centroid().object());
+            const double d = this->_metric(obj, it->centroid().object());
             if(d <= it->radius() || it->bucket_count() < bucket_size)
                 {
-                    // Element fits this ball, or the ball still has room (in
-                    // which case absorbing the element will simply grow r_i).
+                    // Element fits this ball, or the ball still has room
+                    // (absorbing the element will simply grow r_i).
                     it->insert(obj, id, d);
                     if(it->bucket_count() > bucket_size)
                         {
-                            // Bucket overflows: eject the farthest member and
-                            // continue inserting it in the tail of the list.
                             internal_object_t ejected = it->pop_farthest();
                             obj = ejected.object();
                             id  = ejected.id();
@@ -105,23 +109,19 @@ void listofclusters<object_t,distance,bucket_size,overflow>::insert(const object
         }
 
     // No existing ball absorbed the element - it becomes the next center.
-    cluster_t fresh(this->_cid++, internal_object_t(obj, id));
-    this->_list.push_back(std::move(fresh));
+    this->_list.emplace_back(this->_cid++, internal_object_t(obj, id));
 }
 
 // ---------------------------------------------------------------------------
 // remove
-//
-// Find the cluster whose ball contains _object and remove _id from it. If
-// the cluster becomes empty (centroid ghosted, bucket empty), erase the
-// cluster from the list to keep traversals tight.
 // ---------------------------------------------------------------------------
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-void listofclusters<object_t,distance,bucket_size,overflow>::remove(const object_t &_object,const uint32_t &_id)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::remove(const object_t &_object, const uint32_t &_id)
 {
     for(auto it = this->_list.begin(); it != this->_list.end(); ++it)
         {
-            const double d = distance(_object, it->centroid().object());
+            const double d = this->_metric(_object, it->centroid().object());
             if(d <= it->radius() || it->centroid().id() == _id)
                 {
                     it->remove(_id);
@@ -132,8 +132,9 @@ void listofclusters<object_t,distance,bucket_size,overflow>::remove(const object
         }
 }
 
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-void listofclusters<object_t,distance,bucket_size,overflow>::clear(void)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::clear(void) noexcept
 {
     this->_list.clear();
     this->_dcache.clear();
@@ -141,15 +142,12 @@ void listofclusters<object_t,distance,bucket_size,overflow>::clear(void)
 }
 
 // ---------------------------------------------------------------------------
-// range_search (public)
-//
-// Build a resultslist around the query and run the recursive Search of
-// Figure 2 of the paper. The "preempt when query ball is totally contained"
-// optimization (`return` instead of `continue`) is in the inner overload.
+// range_search (public) and recursive search of the flat list
 // ---------------------------------------------------------------------------
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t
-listofclusters<object_t,distance,bucket_size,overflow>::range_search(const object_t &_object,const uint32_t &_id,const double &_radius)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+typename listofclusters<object_t,distance_t,bucket_size,overflow>::resultslist_t
+listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(const object_t &_object, const uint32_t &_id, const double &_radius)
 {
     resultslist_t results(internal_object_t(_object, _id));
     this->range_search(results, _radius);
@@ -157,62 +155,59 @@ listofclusters<object_t,distance,bucket_size,overflow>::range_search(const objec
     return results;
 }
 
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-void listofclusters<object_t,distance,bucket_size,overflow>::range_search(resultslist_t &_results,const double &_radius)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resultslist_t &_results, const double &_radius)
 {
-    for(auto &cluster : this->_list)
+    for(const auto &c : this->_list)
         {
-            const double d = this->internal_distance(_results.centroid(), cluster.centroid());
-            if((d - _radius) <= cluster.radius())
-                this->explore(_results, cluster, _radius);
-            if((d + _radius) <= cluster.radius())
-                return;  // query ball totally contained - no need to look further
+            const double d = this->internal_distance(_results.centroid(), c.centroid());
+            if((d - _radius) <= c.radius())
+                this->explore(_results, c, _radius);
+            if((d + _radius) <= c.radius())
+                return;  // query ball totally contained
         }
 }
 
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-void listofclusters<object_t,distance,bucket_size,overflow>::explore(resultslist_t &_results,const cluster_t &_cluster,const double &_radius)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::explore(resultslist_t &_results, const cluster_t &_cluster, const double &_radius)
 {
     const double dqc = this->internal_distance(_results.centroid(), _cluster.centroid());
 
     if(dqc <= _radius && !_cluster.centroid().ghost() && _cluster.centroid().id() != _results.centroid().id())
         _results.push(_cluster.centroid().object(), _cluster.centroid().id(), dqc);
 
-    for(const auto &object : _cluster.bucket())
+    for(const auto &o : _cluster.bucket())
         {
             // Triangle-inequality prune at the per-bucket-element level.
-            if((dqc - _radius) <= object.distance() && (dqc + _radius) >= object.distance())
+            if((dqc - _radius) <= o.distance() && (dqc + _radius) >= o.distance())
                 {
-                    const double d = this->internal_distance(_results.centroid(), object);
-                    if(d <= _radius && _results.centroid().id() != object.id())
-                        _results.push(object.object(), object.id(), d);
+                    const double d = this->internal_distance(_results.centroid(), o);
+                    if(d <= _radius && _results.centroid().id() != o.id())
+                        _results.push(o.object(), o.id(), d);
                 }
         }
 }
 
 // ---------------------------------------------------------------------------
 // knn_search
-//
-// k-NN over LC: start with a radius derived from the cluster geometry,
-// repeat range_search with an expanding radius until we have at least k
-// candidates. Each range_search reuses cached distances via _dcache.
 // ---------------------------------------------------------------------------
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-typename listofclusters<object_t,distance,bucket_size,overflow>::resultslist_t
-listofclusters<object_t,distance,bucket_size,overflow>::knn_search(const object_t &_object,const uint32_t &_id,const size_t &_k)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+typename listofclusters<object_t,distance_t,bucket_size,overflow>::resultslist_t
+listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const object_t &_object, const uint32_t &_id, const size_t &_k)
 {
     resultslist_t results(internal_object_t(_object, _id), _k);
 
     double radius = MAX_RADIUS;
     double min_external_radius = MAX_RADIUS;
 
-    // Initial radius estimate: smallest "margin" of any cluster around the
-    // query. If the query is inside a cluster (diff>0), use the smallest
-    // such inside-margin; otherwise use the smallest outside-margin.
-    for(auto &cluster : this->_list)
+    // Initial radius estimate from the cluster geometry.
+    for(const auto &c : this->_list)
         {
-            const double d    = this->internal_distance(cluster.centroid(), results.centroid());
-            const double diff = cluster.radius() - d;
+            const double d    = this->internal_distance(c.centroid(), results.centroid());
+            const double diff = c.radius() - d;
             if(diff > 0.0 && diff < radius)
                 radius = diff;
             else if((-diff) > 0.0 && (-diff) < min_external_radius)
@@ -232,13 +227,14 @@ listofclusters<object_t,distance,bucket_size,overflow>::knn_search(const object_
     return results;
 }
 
-template <class object_t,double (*distance)(object_t,object_t),size_t bucket_size,size_t overflow>
-double listofclusters<object_t,distance,bucket_size,overflow>::internal_distance(const internal_object_t &_a,const internal_object_t &_b)
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+double listofclusters<object_t,distance_t,bucket_size,overflow>::internal_distance(const internal_object_t &_a, const internal_object_t &_b)
 {
     auto &inner = this->_dcache[_a.id()];
     auto it = inner.find(_b.id());
     if(it == inner.end())
-        it = inner.emplace(_b.id(), distance(_a.object(), _b.object())).first;
+        it = inner.emplace(_b.id(), this->_metric(_a.object(), _b.object())).first;
     return it->second;
 }
 
