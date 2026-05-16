@@ -75,6 +75,14 @@ is a true metric** — non-negative, identity, symmetric, triangle inequality
 | `metric::minkowski<p>` | Lp = `(Σ ǀa_i − b_iǀᵖ)^(1/p)`, `p ≥ 1` | real vectors |
 | `metric::hamming` | count of positions where `a_i ≠ b_i` | any equality-comparable |
 | `metric::angular` | `arccos(⟨a,b⟩ / (ǀaǀ ǀbǀ))` | non-zero vectors |
+| `metric::jaccard` | `1 − ǀA∩Bǀ / ǀA∪Bǀ` on binary vectors | sparse sets |
+| `metric::canberra` | `Σ ǀa_i − b_iǀ / (ǀa_iǀ + ǀb_iǀ)`, `0/0 ↦ 0` | non-negative reals |
+| `metric::levenshtein` | edit distance (insert/delete/substitute) | strings, integer sequences |
+
+The set is also exposed as a compile-time registry,
+`metric::available_metrics[]` (with `name`, `description`, `domain` for each).
+Useful for consumers (e.g. the future Python wrapper) that need to
+enumerate what's available without hand-listing.
 
 ### What's deliberately NOT here
 

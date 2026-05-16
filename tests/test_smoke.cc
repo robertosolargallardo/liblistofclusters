@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 using vec_t = std::vector<double>;
@@ -400,6 +401,56 @@ static void test_builtin_metrics()
     std::cout << "  test_builtin_metrics: OK (euclidean, manhattan, chebyshev, minkowski<3>, hamming, angular)\n";
 }
 
+// Hand-computed expected values for the second batch of metrics.
+static void test_more_builtin_metrics()
+{
+    auto approx = [](double x, double y, double eps = 1e-9) {
+        return std::abs(x - y) < eps;
+    };
+
+    // jaccard: a = {1, 1, 0}, b = {1, 0, 1}. union = 3, intersect = 1.
+    const std::vector<int> ja = {1, 1, 0};
+    const std::vector<int> jb = {1, 0, 1};
+    assert(approx(metric::jaccard{}(ja, jb), 1.0 - 1.0 / 3.0));
+    // Empty sets (all zero) -> distance 0.
+    const std::vector<int> empty = {0, 0, 0};
+    assert(approx(metric::jaccard{}(empty, empty), 0.0));
+
+    // canberra: a = {1, 2}, b = {3, 4}.
+    //   term 0: |1-3| / (1+3) = 2/4 = 0.5
+    //   term 1: |2-4| / (2+4) = 2/6 = 0.333...
+    const std::vector<double> ca = {1.0, 2.0};
+    const std::vector<double> cb = {3.0, 4.0};
+    assert(approx(metric::canberra{}(ca, cb), 0.5 + 2.0 / 6.0));
+    // d(x, x) = 0
+    assert(approx(metric::canberra{}(ca, ca), 0.0));
+
+    // levenshtein: "kitten" -> "sitting" = 3 (substitute k->s, e->i, insert g).
+    const std::string s1 = "kitten";
+    const std::string s2 = "sitting";
+    assert(metric::levenshtein{}(s1, s2) == 3.0);
+    // Identity.
+    assert(metric::levenshtein{}(s1, s1) == 0.0);
+    // Pure insertion: "" -> "abc" = 3.
+    assert(metric::levenshtein{}(std::string{}, std::string{"abc"}) == 3.0);
+
+    // Registry is non-empty and entries are well-formed.
+    assert(metric::available_metrics_count > 0);
+    bool saw_euclidean = false;
+    bool saw_levenshtein = false;
+    for (std::size_t i = 0; i < metric::available_metrics_count; ++i) {
+        const auto &m = metric::available_metrics[i];
+        assert(!m.name.empty());
+        assert(!m.description.empty());
+        if (m.name == "euclidean") saw_euclidean = true;
+        if (m.name == "levenshtein") saw_levenshtein = true;
+    }
+    assert(saw_euclidean && saw_levenshtein);
+
+    std::cout << "  test_more_builtin_metrics: OK (jaccard, canberra, levenshtein, registry "
+              << metric::available_metrics_count << " entries)\n";
+}
+
 // Batch remove should leave the index in the same state as a serial loop
 // of remove() calls and removed ids must no longer be retrievable.
 static void test_batch_remove()
@@ -458,6 +509,7 @@ int main()
     test_batch_insert_matches_serial();
     test_bulk_build_matches_brute_force();
     test_builtin_metrics();
+    test_more_builtin_metrics();
     test_batch_remove();
     std::cout << "all tests passed\n";
     return 0;
