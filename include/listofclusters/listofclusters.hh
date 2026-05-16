@@ -65,7 +65,6 @@ public:
 private:
     void range_search(resultslist_t&, const double&);
     void explore(resultslist_t&, const cluster_t&, const double&);
-    double internal_distance(const internal_object_t&, const internal_object_t&);
 
     static_assert(overflow >= bucket_size,
                   "overflow must be >= bucket_size (legacy invariant)");
@@ -156,39 +155,73 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resultslist_t &_results, const double &_radius)
 {
+    // Hoist query object out of the resultslist getter so each iteration
+    // does not chase the centroid()/.object() chain.
+    const object_t &q = _results.centroid().object();
+    const uint32_t qid = _results.centroid().id();
+
     for(const auto &c : this->_list)
         {
-            const double d = this->internal_distance(_results.centroid(), c.centroid());
+            const internal_object_t &cc = c.centroid();
+            const double d = this->_metric(q, cc.object());
+
+            // Query ball intersects cluster ball -> explore bucket
             if((d - _radius) <= c.radius())
-                this->explore(_results, c, _radius);
+                {
+                    if(d <= _radius && !cc.ghost() && cc.id() != qid)
+                        _results.push(cc.object(), cc.id(), d);
+
+                    for(const auto &o : c.bucket())
+                        {
+                            // Triangle-inequality prune (uses precomputed
+                            // o.distance() = d(centroid, o), no metric call)
+                            if((d - _radius) <= o.distance() && (d + _radius) >= o.distance())
+                                {
+                                    const double md = this->_metric(q, o.object());
+                                    if(md <= _radius && o.id() != qid)
+                                        _results.push(o.object(), o.id(), md);
+                                }
+                        }
+                }
             if((d + _radius) <= c.radius())
                 return;  // query ball totally contained
         }
 }
 
+// explore() retained for ABI compatibility; thin wrapper around the
+// inlined logic in range_search above.
 template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::explore(resultslist_t &_results, const cluster_t &_cluster, const double &_radius)
 {
-    const double dqc = this->internal_distance(_results.centroid(), _cluster.centroid());
+    const object_t &q = _results.centroid().object();
+    const uint32_t qid = _results.centroid().id();
+    const internal_object_t &cc = _cluster.centroid();
+    const double dqc = this->_metric(q, cc.object());
 
-    if(dqc <= _radius && !_cluster.centroid().ghost() && _cluster.centroid().id() != _results.centroid().id())
-        _results.push(_cluster.centroid().object(), _cluster.centroid().id(), dqc);
+    if(dqc <= _radius && !cc.ghost() && cc.id() != qid)
+        _results.push(cc.object(), cc.id(), dqc);
 
     for(const auto &o : _cluster.bucket())
         {
-            // Triangle-inequality prune at the per-bucket-element level.
             if((dqc - _radius) <= o.distance() && (dqc + _radius) >= o.distance())
                 {
-                    const double d = this->internal_distance(_results.centroid(), o);
-                    if(d <= _radius && _results.centroid().id() != o.id())
+                    const double d = this->_metric(q, o.object());
+                    if(d <= _radius && o.id() != qid)
                         _results.push(o.object(), o.id(), d);
                 }
         }
 }
 
 // ---------------------------------------------------------------------------
-// knn_search
+// knn_search - single-pass shrinking-radius algorithm
+//
+// The previous implementation called range_search in an expanding-radius
+// retry loop until k results accumulated. Each retry was a full re-traversal
+// of the cluster list, so a worst-case query revisited every cluster 2-3
+// times. The single-pass version below walks the list once: it maintains
+// top-k results, uses the kth-best distance as a shrinking radius, and
+// prunes clusters and bucket members via triangle inequality as it goes.
 // ---------------------------------------------------------------------------
 template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
@@ -196,44 +229,57 @@ typename listofclusters<object_t,distance_t,bucket_size,overflow>::resultslist_t
 listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const object_t &_object, const uint32_t &_id, const size_t &_k)
 {
     resultslist_t results(internal_object_t(_object, _id), _k);
+    const object_t &q = _object;
+    const uint32_t qid = _id;
 
+    // Current pruning radius: the kth-best distance once we've accumulated
+    // k results, otherwise infinity.
     double radius = MAX_RADIUS;
-    double min_external_radius = MAX_RADIUS;
+    auto refresh_radius = [&]() {
+        if (results.size() >= _k)
+            radius = std::prev(results.results().end())->distance();
+    };
 
-    // Initial radius estimate from the cluster geometry.
-    for(const auto &c : this->_list)
+    for (const auto &c : this->_list)
         {
-            const double d    = this->internal_distance(c.centroid(), results.centroid());
-            const double diff = c.radius() - d;
-            if(diff > 0.0 && diff < radius)
-                radius = diff;
-            else if((-diff) > 0.0 && (-diff) < min_external_radius)
-                min_external_radius = -diff;
-        }
-    radius = (radius == MAX_RADIUS) ? min_external_radius : radius;
+            const internal_object_t &cc = c.centroid();
+            const double d = this->_metric(q, cc.object());
 
-    do
-        {
-            this->range_search(results, radius);
-            if(radius == MAX_RADIUS || radius == 0.0) break;
-            radius += radius * RADIUS_INC_PERC;
+            // 1. Centroid candidate.
+            if (d < radius && !cc.ghost() && cc.id() != qid)
+                {
+                    results.push(cc.object(), cc.id(), d);
+                    refresh_radius();
+                }
+
+            // 2. Explore bucket if the query ball intersects this cluster.
+            if ((d - radius) <= c.radius())
+                {
+                    for (const auto &m : c.bucket())
+                        {
+                            // Triangle-inequality prune (cheap, no metric call).
+                            if ((d - radius) <= m.distance() && (d + radius) >= m.distance())
+                                {
+                                    const double md = this->_metric(q, m.object());
+                                    if (md < radius && m.id() != qid)
+                                        {
+                                            results.push(m.object(), m.id(), md);
+                                            refresh_radius();
+                                        }
+                                }
+                        }
+                }
+
+            // 3. Early termination: query ball entirely inside this cluster.
+            //    By construction of LC (first cluster wins for overlapping
+            //    balls), no later cluster can hold a closer point.
+            if ((d + radius) <= c.radius())
+                break;
         }
-    while(results.results().size() < _k);
 
     return results;
 }
 
-template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
-    requires Metric<distance_t, object_t>
-double listofclusters<object_t,distance_t,bucket_size,overflow>::internal_distance(const internal_object_t &_a, const internal_object_t &_b)
-{
-    // Direct call. Earlier code memoized via a nested
-    // std::map<uint32_t, std::map<uint32_t, double>>, but benchmarking
-    // showed it had no measurable impact on kNN throughput (each query
-    // touches each centroid at most a couple of times, so the map lookup
-    // overhead canceled out the savings). Removed in the same commit.
-    return this->_metric(_a.object(), _b.object());
-}
 
 }  // namespace metric
 #endif

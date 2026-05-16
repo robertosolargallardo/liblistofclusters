@@ -109,6 +109,29 @@ make_dataset(std::size_t N, std::size_t D, std::uint32_t seed)
     return db;
 }
 
+// Mixture-of-Gaussians: points form `clusters` clusters, each centered at a
+// uniformly-random point in [-1,1]^D, with isotropic gaussian noise of
+// stdev = noise_sigma. Models real-world data with intrinsic dimensionality
+// well below the nominal D - which is where LC's pruning actually pays off.
+[[nodiscard]] static std::vector<vec_t>
+make_clustered_dataset(std::size_t N, std::size_t D, std::size_t n_clusters,
+                       double noise_sigma, std::uint32_t seed)
+{
+    std::vector<vec_t> centers(n_clusters, vec_t(D));
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (auto &c : centers) for (auto &x : c) x = u(rng);
+
+    std::vector<vec_t> db(N, vec_t(D));
+    std::uniform_int_distribution<std::size_t> pick(0, n_clusters - 1);
+    std::normal_distribution<double> noise(0.0, noise_sigma);
+    for (auto &v : db) {
+        const auto &c = centers[pick(rng)];
+        for (std::size_t i = 0; i < D; ++i) v[i] = c[i] + noise(rng);
+    }
+    return db;
+}
+
 // Build a fresh index from `db` once; return mean time per insert.
 [[nodiscard]] static Stats bench_insert(const std::vector<vec_t> &db, int repeats)
 {
@@ -248,15 +271,29 @@ int main(int argc, char **argv)
     std::size_t D = (argc > 2) ? static_cast<std::size_t>(std::atoll(argv[2])) : 8;
     std::size_t Q = (argc > 3) ? static_cast<std::size_t>(std::atoll(argv[3])) : 200;
     std::size_t k = 10;
+    // Set GEN=clustered (env var or 4th positional) to use the mixture-of-
+    // Gaussians generator. The uniform case is LC's worst case: LC's
+    // triangle-inequality pruning needs structure to be effective.
+    std::string gen = (argc > 4) ? std::string(argv[4]) : std::string(std::getenv("GEN") ? std::getenv("GEN") : "uniform");
 
     std::printf("# liblistofclusters microbenchmarks\n");
-    std::printf("#   dataset: N=%zu, D=%zu, uniform [-1, 1]\n", N, D);
+    std::printf("#   dataset: N=%zu, D=%zu, gen=%s\n", N, D, gen.c_str());
     std::printf("#   queries: Q=%zu, k=%zu\n", Q, k);
     std::printf("#   index:   bucket_size=16, overflow=64\n");
     std::printf("#\n");
 
-    const auto db      = make_dataset(N, D, /*seed=*/42);
-    const auto queries = make_dataset(Q, D, /*seed=*/9999);
+    std::vector<vec_t> db, queries;
+    if (gen == "clustered") {
+        // 64 clusters of ~N/64 points each, gaussian noise tight enough that
+        // points within a cluster are clearly closer to each other than to
+        // any other cluster (sigma << inter-cluster distance).
+        db      = make_clustered_dataset(N, D, /*n_clusters=*/64, /*sigma=*/0.05, /*seed=*/42);
+        // Queries drawn from the SAME distribution - the realistic case.
+        queries = make_clustered_dataset(Q, D, /*n_clusters=*/64, /*sigma=*/0.05, /*seed=*/9999);
+    } else {
+        db      = make_dataset(N, D, /*seed=*/42);
+        queries = make_dataset(Q, D, /*seed=*/9999);
+    }
 
     print_header();
 

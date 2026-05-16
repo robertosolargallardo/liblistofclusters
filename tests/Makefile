@@ -3,7 +3,9 @@ CXXFLAGS?=-Wall -Wextra -Wpedantic -g -O2 -std=c++23 -fsanitize=address,undefine
 INCLUDE=-I../include/
 TARGET=test_smoke
 
-$(TARGET):test_smoke.cc
+HEADERS := $(wildcard ../include/listofclusters/*.hh)
+
+$(TARGET):test_smoke.cc $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) $< -o $@
 
 run: $(TARGET)
