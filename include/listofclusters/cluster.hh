@@ -37,6 +37,15 @@ public:
     internal_object_t centroid(void) const;
     bucket_t bucket(void) const;
 
+    // Direct, non-copying observers needed by the LC insert algorithm.
+    size_t bucket_count(void) const noexcept;
+
+    // Remove and return the bucket member with the largest distance to the
+    // centroid (the LC "fixed bucket size" overflow case ejects this one
+    // and continues inserting it in the tail of the list). Updates _radius
+    // to the new maximum bucket distance (or 0 if the bucket becomes empty).
+    internal_object_t pop_farthest(void);
+
     double radius(void) const;
     void radius(const double&);
 
@@ -112,6 +121,28 @@ void cluster<object_t>::clear(void)
     this->_radius=0.0;
     this->_bucket.clear();
     this->_centroid.ghost(true);
+}
+
+template<class object_t>
+size_t cluster<object_t>::bucket_count(void) const noexcept
+{
+    return this->_bucket.size();
+}
+
+template<class object_t>
+typename cluster<object_t>::internal_object_t cluster<object_t>::pop_farthest(void)
+{
+    // Bucket is std::set<internal_object_t, compare> sorted by (distance, id).
+    // The last element has the largest (distance, id) tuple - i.e. the bucket
+    // member farthest from this cluster's centroid (id breaks ties).
+    auto last = std::prev(this->_bucket.end());
+    internal_object_t farthest = *last;
+    this->_bucket.erase(last);
+    if (this->_bucket.empty())
+        this->_radius = 0.0;
+    else
+        this->_radius = std::prev(this->_bucket.end())->distance();
+    return farthest;
 }
 };
 #endif

@@ -22,16 +22,12 @@ double euclid(vec_t a, vec_t b)
 
 static void test_build_and_knn()
 {
-    // Index parameters: bucket_size=4, overflow=10.
-    // We deliberately stay below the supercluster overflow threshold (N < overflow)
-    // because the cascading-overflow path in listofclusters::insert hits pathological
-    // recursion - tracked separately as C-5. This test exercises the no-overflow path.
     metric::listofclusters<vec_t, euclid, 4, 10> idx;
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<double> u(-1.0, 1.0);
 
-    constexpr std::uint32_t N = 9U;
+    constexpr std::uint32_t N = 64U;
     constexpr std::size_t D = 8U;
 
     std::vector<vec_t> db(N);
@@ -125,12 +121,105 @@ static void test_equal_distance_strict_weak_ordering()
     std::cout << "  test_equal_distance_strict_weak_ordering: OK\n";
 }
 
+// Regression test for C-5 and C-6: the previous incremental insert
+// implementation had a "supercluster" splitting scheme not described in the
+// LC paper. It (a) recursed deep enough to stack-overflow at N=64 and
+// (b) diverged into an unbounded queue cycle at N>=100 even after the
+// recursion was made iterative. Rewriting around the canonical fixed-
+// bucket-size algorithm (Chavez & Navarro 2005, Section 5.3) fixed both:
+// inserts are now O(|list|) per element with deterministic termination.
+static void test_large_n_no_crash()
+{
+    metric::listofclusters<vec_t, euclid, 4, 10> idx;
+
+    constexpr std::uint32_t N = 500U;
+    constexpr std::size_t D = 8U;
+
+    std::vector<vec_t> db(N);
+    std::mt19937 rng(2025);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        idx.insert(db[i], i);
+    }
+
+    constexpr int probes = 32;
+    std::uniform_int_distribution<std::uint32_t> pick(0, N - 1);
+    int hits = 0;
+    for (int p = 0; p < probes; ++p) {
+        const std::uint32_t qid = pick(rng);
+        auto results = idx.knn_search(db[qid], N + p, 1);
+        for (const auto &r : results.results()) {
+            if (r.id() == qid) { ++hits; break; }
+        }
+    }
+    assert(hits == probes && "C-5/C-6 regression: some inserted objects not retrievable");
+    std::cout << "  test_large_n_no_crash: OK (" << probes
+              << " probes, all found in N=" << N << ")\n";
+}
+
+// Correctness vs brute force: for several queries the LC knn result must
+// contain exactly the k nearest neighbors according to a full O(N) scan.
+static void test_knn_matches_brute_force()
+{
+    metric::listofclusters<vec_t, euclid, 4, 10> idx;
+
+    constexpr std::uint32_t N = 300U;
+    constexpr std::size_t D = 6U;
+    constexpr std::size_t k = 5U;
+
+    std::vector<vec_t> db(N);
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        idx.insert(db[i], i);
+    }
+
+    constexpr int queries = 10;
+    int total_recall_hits = 0;
+    for (int q = 0; q < queries; ++q) {
+        vec_t query(D);
+        for (std::size_t j = 0; j < D; ++j) query[j] = u(rng);
+        const std::uint32_t qid = N + q;
+
+        // Brute force ground truth.
+        std::vector<std::pair<double, std::uint32_t>> bf;
+        bf.reserve(N);
+        for (std::uint32_t i = 0; i < N; ++i) bf.emplace_back(euclid(query, db[i]), i);
+        std::sort(bf.begin(), bf.end());
+
+        std::vector<std::uint32_t> expected;
+        for (std::size_t i = 0; i < k; ++i) expected.push_back(bf[i].second);
+
+        auto results = idx.knn_search(query, qid, k);
+        std::vector<std::uint32_t> got;
+        for (const auto &r : results.results()) got.push_back(r.id());
+
+        std::sort(expected.begin(), expected.end());
+        std::sort(got.begin(), got.end());
+
+        for (auto id : expected) {
+            if (std::find(got.begin(), got.end(), id) != got.end()) ++total_recall_hits;
+        }
+    }
+    const int total_expected = queries * static_cast<int>(k);
+    assert(total_recall_hits == total_expected && "LC knn missed brute-force neighbors");
+    std::cout << "  test_knn_matches_brute_force: OK (" << total_recall_hits
+              << "/" << total_expected << " recall over " << queries
+              << " queries, N=" << N << " k=" << k << ")\n";
+}
+
 int main()
 {
     std::cout << "liblistofclusters smoke tests:\n";
     test_build_and_knn();
     test_range_search();
     test_equal_distance_strict_weak_ordering();
+    test_large_n_no_crash();
+    test_knn_matches_brute_force();
     std::cout << "all tests passed\n";
     return 0;
 }
