@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  cpp-tests:
+    name: C++ tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcc-14 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y g++-14
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Compiler version
+        run: ${CXX:-c++} --version | head -1
+
+      - name: Build + run smoke tests (ASan+UBSan)
+        run: make test
+
+      - name: Build + run bench (smoke, not regression-gated)
+        run: make bench
+
+  python-wrapper:
+    name: Python wrapper (${{ matrix.os }}, Py ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install gcc-14 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y g++-14
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+
+      - name: Upgrade pip + install runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pytest
+
+      - name: Build + install wrapper
+        run: pip install python/
+
+      - name: Run pytest
+        # cd into python/ so the conftest.py is found, but pytest still
+        # imports the *installed* listofclusters package (conftest drops the
+        # source dir from sys.path on collection).
+        run: cd python && pytest tests/ -v
