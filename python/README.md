@@ -7,7 +7,11 @@ nearest-neighbor index. Built with [nanobind](https://github.com/wjakob/nanobind
 ## Install
 
 ```sh
-# from this directory:
+# Recommended: uv (https://github.com/astral-sh/uv)
+uv venv && source .venv/bin/activate
+uv pip install .
+
+# Or plain pip from this directory:
 pip install .
 ```
 
