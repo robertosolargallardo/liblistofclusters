@@ -14,7 +14,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(LISTOFCLUSTERS_BUILD_TESTS    "Build unit tests"                  ON)
-option(LISTOFCLUSTERS_BUILD_EXAMPLES "Build example apps (needs Armadillo)" OFF)
 option(LISTOFCLUSTERS_BUILD_BENCH    "Build benchmarks"                  OFF)
 option(LISTOFCLUSTERS_BUILD_PYTHON   "Build Python wrapper"              OFF)
 option(LISTOFCLUSTERS_ENABLE_ASAN    "Enable AddressSanitizer in tests"  ON)
@@ -34,10 +33,6 @@ target_compile_features(listofclusters INTERFACE cxx_std_23)
 if(LISTOFCLUSTERS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
-endif()
-
-if(LISTOFCLUSTERS_BUILD_EXAMPLES)
-    add_subdirectory(examples)
 endif()
 
 if(LISTOFCLUSTERS_BUILD_BENCH)

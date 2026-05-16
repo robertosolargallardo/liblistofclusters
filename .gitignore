@@ -11,12 +11,6 @@ compile_commands.json
 # Test binaries (no extension)
 tests/test_smoke
 
-# Example binaries (built in their own dirs)
-examples/cache/cache
-examples/dbscan/dbscan
-examples/baseline_brute_force/all2all
-examples/baseline_brute_force/baseline_brute_force
-
 # CMake build dirs
 build/
 cmake-build-*/
