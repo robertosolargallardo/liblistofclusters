@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
@@ -323,6 +324,131 @@ bench_knn_simd(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
         samples_ns.push_back(ns);
     }
     (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
+// -----------------------------------------------------------------------------
+// IVFFlat baseline (a la Faiss IndexIVFFlat, scaled down)
+//
+// Build: sample nlist random db points as centroids, assign each db point to
+//        its nearest centroid -> a flat std::vector per centroid ("inverted
+//        list").
+// Query: distance to all nlist centroids, sort to find the top `nprobe`,
+//        exhaustively scan their inverted lists for top-k.
+//
+// Compared to LC: same general family (compact partitioning) but without LC's
+// triangle-inequality pruning between cluster ball and query ball. IVFFlat
+// just probes the top-nprobe lists by centroid distance and accepts whatever
+// lies in those.
+// -----------------------------------------------------------------------------
+struct ivfflat_t {
+    std::vector<vec_t>                                     centroids;
+    std::vector<std::vector<std::pair<vec_t, std::uint32_t>>> lists;
+
+    void build(const std::vector<vec_t> &db, std::size_t nlist, std::uint32_t seed)
+    {
+        nlist = std::min(nlist, db.size());
+        std::vector<std::size_t> idx(db.size());
+        std::iota(idx.begin(), idx.end(), std::size_t{0});
+        std::mt19937 rng(seed);
+        std::shuffle(idx.begin(), idx.end(), rng);
+        idx.resize(nlist);
+
+        centroids.clear();
+        centroids.reserve(nlist);
+        for (auto i : idx) centroids.push_back(db[i]);
+
+        lists.assign(nlist, {});
+        euclid m;
+        for (std::uint32_t i = 0; i < db.size(); ++i) {
+            std::size_t best = 0;
+            double best_d = std::numeric_limits<double>::infinity();
+            for (std::size_t c = 0; c < nlist; ++c) {
+                const double d = m(db[i], centroids[c]);
+                if (d < best_d) { best_d = d; best = c; }
+            }
+            lists[best].emplace_back(db[i], i);
+        }
+    }
+
+    [[nodiscard]] std::vector<std::uint32_t>
+    knn(const vec_t &q, std::size_t k, std::size_t nprobe) const
+    {
+        euclid m;
+        const std::size_t nlist = centroids.size();
+        std::vector<std::pair<double, std::size_t>> cdists;
+        cdists.reserve(nlist);
+        for (std::size_t c = 0; c < nlist; ++c)
+            cdists.emplace_back(m(q, centroids[c]), c);
+        const std::size_t np = std::min(nprobe, nlist);
+        std::partial_sort(cdists.begin(), cdists.begin() + np, cdists.end());
+
+        std::vector<std::pair<double, std::uint32_t>> cands;
+        for (std::size_t i = 0; i < np; ++i) {
+            const auto &list = lists[cdists[i].second];
+            for (const auto &[v, id] : list)
+                cands.emplace_back(m(q, v), id);
+        }
+        const std::size_t take = std::min(k, cands.size());
+        std::partial_sort(cands.begin(), cands.begin() + take, cands.end());
+        std::vector<std::uint32_t> out;
+        out.reserve(take);
+        for (std::size_t i = 0; i < take; ++i) out.push_back(cands[i].second);
+        return out;
+    }
+};
+
+// IVFFlat bench helper. Reports throughput AND recall@k vs brute force.
+[[nodiscard]] static Stats
+bench_knn_ivfflat(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+                  std::size_t k, int repeats,
+                  std::size_t nlist, std::size_t nprobe,
+                  double &recall_out)
+{
+    ivfflat_t ivf;
+    ivf.build(db, nlist, /*seed=*/42);
+
+    // Ground truth.
+    std::vector<std::vector<std::uint32_t>> gt(queries.size());
+    {
+        euclid m;
+        for (std::size_t q = 0; q < queries.size(); ++q) {
+            std::vector<std::pair<double, std::uint32_t>> bf;
+            bf.reserve(db.size());
+            for (std::uint32_t i = 0; i < db.size(); ++i)
+                bf.emplace_back(m(queries[q], db[i]), i);
+            std::partial_sort(bf.begin(), bf.begin() + std::min<std::size_t>(k, bf.size()), bf.end());
+            for (std::size_t i = 0; i < std::min<std::size_t>(k, bf.size()); ++i)
+                gt[q].push_back(bf[i].second);
+        }
+    }
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    std::size_t total_hits = 0;
+    std::size_t total_expected = 0;
+    volatile std::size_t sink = 0;
+
+    for (int r = 0; r < repeats; ++r) {
+        std::size_t hits_this_run = 0;
+        const double ns = time_ns([&] {
+            for (std::size_t q = 0; q < queries.size(); ++q) {
+                auto got = ivf.knn(queries[q], k, nprobe);
+                sink += got.size();
+                if (r == 0) {
+                    for (auto id : gt[q])
+                        if (std::find(got.begin(), got.end(), id) != got.end()) ++hits_this_run;
+                }
+            }
+        });
+        samples_ns.push_back(ns);
+        if (r == 0) {
+            total_hits = hits_this_run;
+            for (const auto &g : gt) total_expected += g.size();
+        }
+    }
+    (void)sink;
+    recall_out = total_expected ? static_cast<double>(total_hits) / static_cast<double>(total_expected) : 0.0;
     return summarize(std::move(samples_ns), queries.size());
 }
 
@@ -688,6 +814,22 @@ int main(int argc, char **argv)
         /*M=*/16, /*ef_construction=*/200, /*ef_search=*/50, hnsw_recall);
     print_row("knn k=10 (HNSW, approx)", Q, s_knn_hnsw);
 
+    // 3d. IVFFlat approximate baseline (inverted-file / k-cell). nlist =
+    //     sqrt(N) (the Faiss default), nprobe = nlist / 10 (a moderate
+    //     speed/recall point on the IVFFlat tradeoff curve).
+    const std::size_t ivf_nlist  = std::max<std::size_t>(
+        static_cast<std::size_t>(std::sqrt(static_cast<double>(N))), 4);
+    const std::size_t ivf_nprobe = std::max<std::size_t>(ivf_nlist / 10, 1);
+    double ivf_recall = 0.0;
+    const Stats s_knn_ivf = bench_knn_ivfflat(db, queries, k, /*repeats=*/3,
+        ivf_nlist, ivf_nprobe, ivf_recall);
+    {
+        char lbl[80];
+        std::snprintf(lbl, sizeof lbl, "knn k=10 (IVFFlat nlist=%zu nprobe=%zu)",
+                      ivf_nlist, ivf_nprobe);
+        print_row(lbl, Q, s_knn_ivf);
+    }
+
     // 4. Range search (LC). Radius picked to yield ~5-15 results on uniform data.
     const double radius = 0.4;
     const Stats s_range_lc = bench_range(db, queries, radius, /*repeats=*/5);
@@ -710,6 +852,8 @@ int main(int argc, char **argv)
     std::printf("  per-query LC:          %12.3f us\n", s_knn_lc.per_op_ns / 1000.0);
     std::printf("  per-query HNSW (approx): %10.3f us  (recall@%zu = %.3f)\n",
                 s_knn_hnsw.per_op_ns / 1000.0, k, hnsw_recall);
+    std::printf("  per-query IVFFlat:     %12.3f us  (recall@%zu = %.3f, nlist=%zu nprobe=%zu)\n",
+                s_knn_ivf.per_op_ns / 1000.0, k, ivf_recall, ivf_nlist, ivf_nprobe);
     if (saved_per_q_us > 0.0) {
         const double breakeven = build_total_us / saved_per_q_us;
         std::printf("  LC saves per query:    %12.3f us\n", saved_per_q_us);
