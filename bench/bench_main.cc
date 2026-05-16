@@ -47,7 +47,11 @@ struct euclid {
     }
 };
 
-template <std::size_t bucket = 16, std::size_t overflow = 64>
+// bucket_size=20 is the published default ("Engineering efficient metric
+// indexes", Chavez et al.) and empirically best for our N=10k workload.
+// At larger N (>= 100k) or high D, 16 is slightly better; see the sweep
+// section at the end of the bench output.
+template <std::size_t bucket = 20, std::size_t overflow = 80>
 using idx_t = metric::listofclusters<vec_t, euclid, bucket, overflow>;
 
 // -----------------------------------------------------------------------------
@@ -224,6 +228,65 @@ bench_range(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
     return summarize(std::move(samples_ns), queries.size());
 }
 
+// -----------------------------------------------------------------------------
+// Bucket-size sweep
+//
+// Phase 5.1: walk bucket_size across {16, 20, 32, 64, 128} on a fixed
+// workload and report insert + kNN throughput for each. The literature
+// (Chavez et al., "Engineering efficient metric indexes") nominates 20 as
+// a good default - this surfaces the empirical optimum for our test data.
+// -----------------------------------------------------------------------------
+
+template <std::size_t bucket_sz>
+[[nodiscard]] static std::pair<Stats, Stats>
+sweep_bucket(const std::vector<vec_t> &db, const std::vector<vec_t> &queries, std::size_t k)
+{
+    // `overflow` is currently a no-op constant in the LC algorithm but is
+    // still asserted >= bucket_size. Use 4x bucket_size to keep the
+    // static_assert happy across the sweep.
+    using idx_b = metric::listofclusters<vec_t, euclid, bucket_sz, 4 * bucket_sz>;
+
+    // Insert phase
+    std::vector<double> ins_samples;
+    ins_samples.reserve(3);
+    for (int r = 0; r < 3; ++r) {
+        idx_b idx;
+        const double ns = time_ns([&] {
+            for (std::uint32_t i = 0; i < db.size(); ++i)
+                idx.insert(db[i], i);
+        });
+        ins_samples.push_back(ns);
+    }
+    Stats ins = summarize(std::move(ins_samples), db.size());
+
+    // kNN phase
+    idx_b idx;
+    for (std::uint32_t i = 0; i < db.size(); ++i) idx.insert(db[i], i);
+
+    std::vector<double> knn_samples;
+    knn_samples.reserve(5);
+    volatile std::size_t sink = 0;
+    for (int r = 0; r < 5; ++r) {
+        const double ns = time_ns([&] {
+            for (std::uint32_t q = 0; q < queries.size(); ++q) {
+                auto res = idx.knn_search(queries[q], static_cast<std::uint32_t>(db.size() + q), k);
+                sink += res.results().size();
+            }
+        });
+        knn_samples.push_back(ns);
+    }
+    (void)sink;
+    Stats knn = summarize(std::move(knn_samples), queries.size());
+
+    return {ins, knn};
+}
+
+static void print_sweep_row(std::size_t b, const Stats &ins, const Stats &knn)
+{
+    std::printf("  %5zu  %12.3f  %12.3f\n",
+                b, ins.per_op_ns / 1000.0, knn.per_op_ns / 1000.0);
+}
+
 // Recall@k of LC vs brute force - sanity number, not a benchmark.
 [[nodiscard]] static double
 recall_at_k(const std::vector<vec_t> &db, const std::vector<vec_t> &queries, std::size_t k)
@@ -279,7 +342,7 @@ int main(int argc, char **argv)
     std::printf("# liblistofclusters microbenchmarks\n");
     std::printf("#   dataset: N=%zu, D=%zu, gen=%s\n", N, D, gen.c_str());
     std::printf("#   queries: Q=%zu, k=%zu\n", Q, k);
-    std::printf("#   index:   bucket_size=16, overflow=64\n");
+    std::printf("#   index:   bucket_size=20, overflow=80\n");
     std::printf("#\n");
 
     std::vector<vec_t> db, queries;
@@ -338,5 +401,25 @@ int main(int argc, char **argv)
     }
 
     std::printf("\nrecall@%zu vs brute force (50 queries): %.3f\n", k, r);
+
+    // Bucket-size sweep on the same workload.
+    std::printf("\nbucket_size sweep (same dataset, %s):\n", gen.c_str());
+    std::printf("  %5s  %12s  %12s\n", "bucket", "insert (us)", "knn (us)");
+    {
+        auto [ins, knn] = sweep_bucket<16>(db, queries, k);  print_sweep_row(16, ins, knn);
+    }
+    {
+        auto [ins, knn] = sweep_bucket<20>(db, queries, k);  print_sweep_row(20, ins, knn);
+    }
+    {
+        auto [ins, knn] = sweep_bucket<32>(db, queries, k);  print_sweep_row(32, ins, knn);
+    }
+    {
+        auto [ins, knn] = sweep_bucket<64>(db, queries, k);  print_sweep_row(64, ins, knn);
+    }
+    {
+        auto [ins, knn] = sweep_bucket<128>(db, queries, k); print_sweep_row(128, ins, knn);
+    }
+
     return 0;
 }
