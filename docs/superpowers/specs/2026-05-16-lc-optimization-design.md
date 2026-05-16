@@ -351,20 +351,59 @@ Each has an off switch (trait for P1, `k_anchors=0` for P2,
 implicit-with-P1 for P3 with a scalar fallback otherwise,
 `build_strategy::first_unassigned` for P4).
 
-### 9.1 Interaction with existing per-cluster pivots (Phase 5.6)
+### 9.1 Removal of existing per-cluster pivots (Phase 5.6)
 
-The library already ships an opt-in `use_pivots` flag in `bulk_build`
-that stores one per-cluster pivot plus per-bucket-member pivot
-distances (see `cluster.hh`). AESA-lite (P2) is a strictly more
-general filter — k global anchors used for **every** cluster's
-candidates, with no per-cluster bookkeeping. Behavior:
+The library ships an opt-in `use_pivots` flag in `bulk_build` that
+stores one per-cluster pivot plus per-bucket-member pivot distances
+(`cluster_t::_pivot`, `internal_object_t::pivot_distance`). Phase 5.6
+documented it as a **negative result**: query-time wins didn't pay for
+the per-cluster bookkeeping, so the default has been `false` since it
+landed.
 
-- The two coexist. `use_pivots=true` (per-cluster) and `k_anchors>0`
-  (global AESA) can both be on; query path applies both filters.
-- Default recommendation flips to `use_pivots=false` once AESA is
-  shipped — AESA subsumes its job, with one global k×N table instead
-  of a per-cluster pivot per cluster. Bench will confirm.
-- Existing API and tests for `use_pivots` stay; we don't break callers.
+AESA-lite (P2) is a strictly more general version of the same idea — k
+**global** anchors shared across all clusters, with one flat k×N
+table, prunes candidates the per-cluster pivot bound also prunes (and
+more). Keeping both means carrying dead opt-in infrastructure for no
+benefit. As part of this work we **remove** the per-cluster pivot
+machinery:
+
+- Drop `use_pivots` parameter from `bulk_build`.
+- Drop `_pivot`, `has_pivot()`, `pivot()`, `set_pivot()` from
+  `cluster_t`.
+- Drop `pivot_distance` from `internal_object_t`.
+- Drop the `c.has_pivot()` branches in `knn_search` /
+  `range_search` / `explore`.
+- Drop the corresponding test cases and bench rows.
+
+Net effect: smaller `cluster_t` and `internal_object_t`, simpler
+query paths, no orphan API. The removal lands in the same series of
+commits as P2 — never a window where both the old and new pivot
+mechanisms are in tree.
+
+### 9.2 Removal of the two-tier block index (Phase 5.8)
+
+The same logic applies to `_blocks`, `block_t`, `build_block_index()`,
+and the tiered branches in `knn_search` / `range_search`. Phase 5.8
+documented the block index as a negative result ("Empirically this
+does not help (and sometimes slightly hurts) workloads where
+consecutive clusters aren't spatially close, which is the typical
+case under LC's order-dependent invariant"). It is opt-in dead code
+under the same definition.
+
+As part of this work we also remove:
+
+- `block_t` struct.
+- `_blocks` member.
+- `build_block_index()` method.
+- The `if (tiered)` / `if (!_blocks.empty())` branches in
+  `range_search` and `knn_search`.
+- Related tests and the bench row for the blocks variant.
+
+P1 and P3 together — batched centroid distances, then walk in
+nearest-first order — supersede whatever the block index was trying
+to do (one distance call pruning many clusters at once). Removal
+happens alongside P1 to keep the query-path branches simple from the
+start.
 
 ## 10. Testing
 
