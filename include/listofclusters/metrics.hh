@@ -32,10 +32,18 @@
 //   - dot product, anything where larger = closer
 
 #include <listofclusters/glob.hh>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <iterator>
 #include <string_view>
+
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#endif
+#if defined(__AVX2__)
+#  include <immintrin.h>
+#endif
 
 namespace metric
 {
@@ -225,6 +233,77 @@ struct levenshtein {
     }
 };
 
+// L2 (Euclidean) on std::array<double, D> with explicit SIMD intrinsics:
+// NEON pairs (2 doubles per register) on arm64, AVX2 (4 doubles per register)
+// on x86_64, scalar fallback elsewhere. Use this in place of metric::euclidean
+// when (a) your object_t is exactly a fixed-D std::array<double, D> and
+// (b) measurements show the auto-vectorized scalar form is leaving cycles
+// on the table.
+//
+// As of clang 17 on Apple Silicon the scalar `euclidean` functor only emits
+// scalar `fmadd` instructions for D=8 - 8 separate ops where NEON could do
+// 4 pairs. This explicit form forces the SIMD path.
+template <std::size_t D>
+struct euclidean_simd {
+    [[nodiscard]] double operator()(const std::array<double, D> &a,
+                                    const std::array<double, D> &b) const noexcept
+    {
+#if defined(__ARM_NEON)
+        float64x2_t acc0 = vdupq_n_f64(0.0);
+        float64x2_t acc1 = vdupq_n_f64(0.0);
+        std::size_t i = 0;
+        for (; i + 4 <= D; i += 4) {
+            float64x2_t va0 = vld1q_f64(a.data() + i);
+            float64x2_t vb0 = vld1q_f64(b.data() + i);
+            float64x2_t va1 = vld1q_f64(a.data() + i + 2);
+            float64x2_t vb1 = vld1q_f64(b.data() + i + 2);
+            float64x2_t d0 = vsubq_f64(va0, vb0);
+            float64x2_t d1 = vsubq_f64(va1, vb1);
+            acc0 = vfmaq_f64(acc0, d0, d0);
+            acc1 = vfmaq_f64(acc1, d1, d1);
+        }
+        for (; i + 2 <= D; i += 2) {
+            float64x2_t va = vld1q_f64(a.data() + i);
+            float64x2_t vb = vld1q_f64(b.data() + i);
+            float64x2_t d = vsubq_f64(va, vb);
+            acc0 = vfmaq_f64(acc0, d, d);
+        }
+        float64x2_t acc = vaddq_f64(acc0, acc1);
+        double s = vgetq_lane_f64(acc, 0) + vgetq_lane_f64(acc, 1);
+        for (; i < D; ++i) {
+            const double d = a[i] - b[i];
+            s += d * d;
+        }
+        return std::sqrt(s);
+#elif defined(__AVX2__)
+        __m256d acc = _mm256_setzero_pd();
+        std::size_t i = 0;
+        for (; i + 4 <= D; i += 4) {
+            __m256d va = _mm256_loadu_pd(a.data() + i);
+            __m256d vb = _mm256_loadu_pd(b.data() + i);
+            __m256d d  = _mm256_sub_pd(va, vb);
+            acc        = _mm256_fmadd_pd(d, d, acc);
+        }
+        alignas(32) double tail[4];
+        _mm256_store_pd(tail, acc);
+        double s = tail[0] + tail[1] + tail[2] + tail[3];
+        for (; i < D; ++i) {
+            const double d = a[i] - b[i];
+            s += d * d;
+        }
+        return std::sqrt(s);
+#else
+        // Scalar fallback (compiler may still auto-vectorize on most archs).
+        double s = 0.0;
+        for (std::size_t i = 0; i < D; ++i) {
+            const double d = a[i] - b[i];
+            s += d * d;
+        }
+        return std::sqrt(s);
+#endif
+    }
+};
+
 // Compile-time registry of the metrics shipped with this library. Useful
 // for consumers (e.g. Python bindings) that want to enumerate what's
 // available without resorting to reflection. Each entry's `name` matches
@@ -245,6 +324,7 @@ inline constexpr metric_descriptor available_metrics[] = {
     {"jaccard",     "1 - |A and B| / |A or B|, non-zero indices treated as set members",            "binary vectors / sparse sets"},
     {"canberra",    "sum |a_i - b_i| / (|a_i| + |b_i|), 0/0 -> 0 by convention",                    "non-negative real vectors"},
     {"levenshtein", "edit distance: insertions + deletions + substitutions",                        "sequences (strings, integer vectors, ...)"},
+    {"euclidean_simd", "L2 with explicit NEON/AVX2 intrinsics (fixed-D std::array<double, D> only)", "fixed-D real vectors"},
 };
 
 inline constexpr std::size_t available_metrics_count =

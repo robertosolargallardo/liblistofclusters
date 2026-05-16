@@ -29,6 +29,7 @@
 //   - bucket_size sweep
 
 #include <listofclusters/listofclusters.hh>
+#include <listofclusters/metrics.hh>
 
 // Vendored hnswlib for the approximate-NN baseline (phase 5b). Header-only,
 // MIT licensed; see third_party/hnswlib/LICENSE and third_party/hnswlib/VENDOR.txt.
@@ -74,6 +75,10 @@ struct euclid {
 // section at the end of the bench output.
 template <std::size_t bucket = 20, std::size_t overflow = 80>
 using idx_t = metric::listofclusters<vec_t, euclid, bucket, overflow>;
+
+// SIMD-specialized version for the direct comparison row.
+template <std::size_t bucket = 20, std::size_t overflow = 80>
+using idx_t_simd = metric::listofclusters<vec_t, metric::euclidean_simd<kD>, bucket, overflow>;
 
 // -----------------------------------------------------------------------------
 // Timing helpers
@@ -253,6 +258,30 @@ bench_knn_bulk(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
     for (std::uint32_t i = 0; i < db.size(); ++i) ids[i] = i;
     idx_t<> idx;
     idx.bulk_build(db, ids);
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    volatile std::size_t sink = 0;
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            for (std::uint32_t q = 0; q < queries.size(); ++q) {
+                auto res = idx.knn_search(queries[q], static_cast<std::uint32_t>(db.size() + q), k);
+                sink += res.results().size();
+            }
+        });
+        samples_ns.push_back(ns);
+    }
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
+// kNN LC with the explicit NEON/AVX2 Euclidean (vs the auto-vec scalar).
+[[nodiscard]] static Stats
+bench_knn_simd(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+               std::size_t k, int repeats)
+{
+    idx_t_simd<> idx;
+    for (std::uint32_t i = 0; i < db.size(); ++i) idx.insert(db[i], i);
 
     std::vector<double> samples_ns;
     samples_ns.reserve(repeats);
@@ -591,6 +620,11 @@ int main(int argc, char **argv)
     //     two build strategies.
     const Stats s_knn_bulk = bench_knn_bulk(db, queries, k, /*repeats=*/5);
     print_row("knn k=10 (LC bulk, 1T)", Q, s_knn_bulk);
+
+    // 2c. kNN with the explicit NEON/AVX2 Euclidean. Same incremental build,
+    //     only the metric functor differs from row 2.
+    const Stats s_knn_simd = bench_knn_simd(db, queries, k, /*repeats=*/5);
+    print_row("knn k=10 (LC incr, SIMD, 1T)", Q, s_knn_simd);
 
     // 2b. kNN throughput (LC) via batch_knn parallelized across hw threads.
     const unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
