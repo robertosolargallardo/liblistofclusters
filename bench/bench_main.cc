@@ -261,32 +261,45 @@ int main(int argc, char **argv)
     print_header();
 
     // 1. Build (insert all N).
-    {
-        const Stats s = bench_insert(db, /*repeats=*/5);
-        print_row("insert (LC)", N, s);
-    }
-    // 2. kNN throughput (LC).
-    {
-        const Stats s = bench_knn(db, queries, k, /*repeats=*/5);
-        print_row("knn k=10 (LC)", Q, s);
-    }
-    // 3. kNN throughput (brute force baseline).
-    {
-        const Stats s = bench_knn_brute(db, queries, k, /*repeats=*/3);
-        print_row("knn k=10 (brute force)", Q, s);
-    }
+    const Stats s_insert = bench_insert(db, /*repeats=*/5);
+    print_row("insert (LC)", N, s_insert);
+
+    // 2. kNN throughput (LC), queries only - excludes build.
+    const Stats s_knn_lc = bench_knn(db, queries, k, /*repeats=*/5);
+    print_row("knn k=10 (LC, query only)", Q, s_knn_lc);
+
+    // 3. kNN throughput (brute force baseline). Brute force has no build phase.
+    const Stats s_knn_bf = bench_knn_brute(db, queries, k, /*repeats=*/3);
+    print_row("knn k=10 (brute force)", Q, s_knn_bf);
+
     // 4. Range search (LC). Radius picked to yield ~5-15 results on uniform data.
-    {
-        const double radius = 0.4;
-        const Stats s = bench_range(db, queries, radius, /*repeats=*/5);
-        std::string lbl = "range r=0.4 (LC)";
-        print_row(lbl, Q, s);
-    }
-    // 5. Recall@k sanity check.
-    {
-        const double r = recall_at_k(db, std::vector<vec_t>(queries.begin(), queries.begin() + std::min<std::size_t>(50, Q)), k);
-        std::printf("\nrecall@%zu vs brute force (50 queries): %.3f\n", k, r);
+    const double radius = 0.4;
+    const Stats s_range_lc = bench_range(db, queries, radius, /*repeats=*/5);
+    print_row("range r=0.4 (LC, query only)", Q, s_range_lc);
+
+    // 5. Recall@k sanity check (cheap, on a subset of queries).
+    const double r = recall_at_k(db,
+        std::vector<vec_t>(queries.begin(), queries.begin() + std::min<std::size_t>(50, Q)), k);
+
+    // Honest build-amortization summary. LC pays a one-time build cost
+    // (insert * N) and saves time vs brute force on each subsequent query
+    // IF its per-query time is lower. Print build-time, per-query savings,
+    // and the break-even query count.
+    const double build_total_us  = (s_insert.per_op_ns * static_cast<double>(N)) / 1000.0;
+    const double saved_per_q_us  = (s_knn_bf.per_op_ns - s_knn_lc.per_op_ns) / 1000.0;
+    std::printf("\nbuild amortization (kNN):\n");
+    std::printf("  one-time build:        %12.1f us  (insert * N)\n", build_total_us);
+    std::printf("  per-query brute:       %12.3f us\n", s_knn_bf.per_op_ns / 1000.0);
+    std::printf("  per-query LC:          %12.3f us\n", s_knn_lc.per_op_ns / 1000.0);
+    if (saved_per_q_us > 0.0) {
+        const double breakeven = build_total_us / saved_per_q_us;
+        std::printf("  LC saves per query:    %12.3f us\n", saved_per_q_us);
+        std::printf("  break-even at queries: %12.0f\n", breakeven);
+    } else {
+        std::printf("  LC saves per query:    %12.3f us  (NEGATIVE - brute force wins)\n", saved_per_q_us);
+        std::printf("  break-even at queries: never at this N\n");
     }
 
+    std::printf("\nrecall@%zu vs brute force (50 queries): %.3f\n", k, r);
     return 0;
 }
