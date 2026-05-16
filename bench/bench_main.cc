@@ -1,0 +1,292 @@
+// Self-contained microbenchmarks for liblistofclusters.
+//
+// No external benchmark framework - just std::chrono with median-of-runs
+// reporting. Build with -O3, no sanitizers (the Makefile in this directory
+// takes care of the flags). The point is to establish baseline numbers
+// before phase 4 (threading) and phase 5 (perf pass) so wins can be
+// measured against a known reference.
+//
+// Usage:
+//   make bench         # build and run
+//   ./bench_main       # run directly
+//   ./bench_main N D   # override default workload size
+//
+// What's reported:
+//   - Insert throughput  (LC build cost)
+//   - kNN throughput     (LC vs brute force baseline)
+//   - Range throughput   (LC vs brute force baseline)
+//   - Recall@k vs brute  (sanity check that the LC results match)
+
+#include <listofclusters/listofclusters.hh>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+
+using vec_t  = std::vector<double>;
+using clock_t_ = std::chrono::steady_clock;
+
+struct euclid {
+    [[nodiscard]] double operator()(const vec_t &a, const vec_t &b) const noexcept
+    {
+        double s = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const double d = a[i] - b[i];
+            s += d * d;
+        }
+        return std::sqrt(s);
+    }
+};
+
+template <std::size_t bucket = 16, std::size_t overflow = 64>
+using idx_t = metric::listofclusters<vec_t, euclid, bucket, overflow>;
+
+// -----------------------------------------------------------------------------
+// Timing helpers
+// -----------------------------------------------------------------------------
+
+template <class F>
+[[nodiscard]] static double time_ns(F &&fn)
+{
+    const auto t0 = clock_t_::now();
+    fn();
+    const auto t1 = clock_t_::now();
+    return std::chrono::duration<double, std::nano>(t1 - t0).count();
+}
+
+struct Stats {
+    double median_ns;
+    double min_ns;
+    double max_ns;
+    double per_op_ns;
+    double ops_per_s;
+};
+
+static Stats summarize(std::vector<double> samples_ns, std::size_t ops_per_sample)
+{
+    std::sort(samples_ns.begin(), samples_ns.end());
+    const double med = samples_ns[samples_ns.size() / 2];
+    const double mn  = samples_ns.front();
+    const double mx  = samples_ns.back();
+    const double per_op = med / static_cast<double>(ops_per_sample);
+    return Stats{med, mn, mx, per_op, 1e9 / per_op};
+}
+
+static void print_header()
+{
+    std::printf("%-32s %10s %12s %14s\n",
+                "benchmark", "ops/sample", "per-op (us)", "throughput (M/s)");
+    std::printf("%s\n", std::string(80, '-').c_str());
+}
+
+static void print_row(const std::string &name, std::size_t ops_per_sample, const Stats &s)
+{
+    std::printf("%-32s %10zu %12.3f %14.3f\n",
+                name.c_str(), ops_per_sample, s.per_op_ns / 1000.0, s.ops_per_s / 1e6);
+}
+
+// -----------------------------------------------------------------------------
+// Workloads
+// -----------------------------------------------------------------------------
+
+[[nodiscard]] static std::vector<vec_t>
+make_dataset(std::size_t N, std::size_t D, std::uint32_t seed)
+{
+    std::vector<vec_t> db(N, vec_t(D));
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (auto &v : db)
+        for (auto &x : v) x = u(rng);
+    return db;
+}
+
+// Build a fresh index from `db` once; return mean time per insert.
+[[nodiscard]] static Stats bench_insert(const std::vector<vec_t> &db, int repeats)
+{
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    for (int r = 0; r < repeats; ++r) {
+        idx_t<> idx;
+        const double ns = time_ns([&] {
+            for (std::uint32_t i = 0; i < db.size(); ++i)
+                idx.insert(db[i], i);
+        });
+        samples_ns.push_back(ns);
+    }
+    return summarize(std::move(samples_ns), db.size());
+}
+
+// Build the index once, then run `Q` kNN queries against it `repeats` times.
+[[nodiscard]] static Stats
+bench_knn(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+          std::size_t k, int repeats)
+{
+    idx_t<> idx;
+    for (std::uint32_t i = 0; i < db.size(); ++i) idx.insert(db[i], i);
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    volatile std::size_t sink = 0;
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            for (std::uint32_t q = 0; q < queries.size(); ++q) {
+                auto res = idx.knn_search(queries[q], static_cast<std::uint32_t>(db.size() + q), k);
+                sink += res.results().size();
+            }
+        });
+        samples_ns.push_back(ns);
+    }
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
+// kNN brute-force baseline (single threaded), for the same workload.
+[[nodiscard]] static Stats
+bench_knn_brute(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+                std::size_t k, int repeats)
+{
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    volatile double sink = 0.0;
+    euclid m;
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            std::vector<std::pair<double, std::uint32_t>> heap;
+            heap.reserve(db.size());
+            for (const auto &q : queries) {
+                heap.clear();
+                for (std::uint32_t i = 0; i < db.size(); ++i)
+                    heap.emplace_back(m(q, db[i]), i);
+                std::partial_sort(heap.begin(), heap.begin() + std::min<std::size_t>(k, heap.size()), heap.end());
+                for (std::size_t i = 0; i < std::min<std::size_t>(k, heap.size()); ++i)
+                    sink += heap[i].first;
+            }
+        });
+        samples_ns.push_back(ns);
+    }
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
+// Range search (LC), radius chosen so each query returns roughly `target_count` neighbors.
+[[nodiscard]] static Stats
+bench_range(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+            double radius, int repeats)
+{
+    idx_t<> idx;
+    for (std::uint32_t i = 0; i < db.size(); ++i) idx.insert(db[i], i);
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    volatile std::size_t sink = 0;
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            for (std::uint32_t q = 0; q < queries.size(); ++q) {
+                auto res = idx.range_search(queries[q], static_cast<std::uint32_t>(db.size() + q), radius);
+                sink += res.results().size();
+            }
+        });
+        samples_ns.push_back(ns);
+    }
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
+// Recall@k of LC vs brute force - sanity number, not a benchmark.
+[[nodiscard]] static double
+recall_at_k(const std::vector<vec_t> &db, const std::vector<vec_t> &queries, std::size_t k)
+{
+    idx_t<> idx;
+    for (std::uint32_t i = 0; i < db.size(); ++i) idx.insert(db[i], i);
+
+    euclid m;
+    std::size_t total_hits = 0;
+    std::size_t total_expected = 0;
+
+    for (std::uint32_t q = 0; q < queries.size(); ++q) {
+        std::vector<std::pair<double, std::uint32_t>> bf;
+        bf.reserve(db.size());
+        for (std::uint32_t i = 0; i < db.size(); ++i)
+            bf.emplace_back(m(queries[q], db[i]), i);
+        std::partial_sort(bf.begin(), bf.begin() + std::min<std::size_t>(k, bf.size()), bf.end());
+
+        std::vector<std::uint32_t> expected;
+        for (std::size_t i = 0; i < std::min<std::size_t>(k, bf.size()); ++i)
+            expected.push_back(bf[i].second);
+
+        auto res = idx.knn_search(queries[q], static_cast<std::uint32_t>(db.size() + q), k);
+        std::vector<std::uint32_t> got;
+        for (const auto &r : res.results()) got.push_back(r.id());
+
+        std::sort(expected.begin(), expected.end());
+        std::sort(got.begin(), got.end());
+
+        for (auto id : expected) {
+            if (std::find(got.begin(), got.end(), id) != got.end()) ++total_hits;
+            ++total_expected;
+        }
+    }
+    return total_expected ? static_cast<double>(total_hits) / static_cast<double>(total_expected) : 0.0;
+}
+
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
+
+int main(int argc, char **argv)
+{
+    std::size_t N = (argc > 1) ? static_cast<std::size_t>(std::atoll(argv[1])) : 10000;
+    std::size_t D = (argc > 2) ? static_cast<std::size_t>(std::atoll(argv[2])) : 8;
+    std::size_t Q = (argc > 3) ? static_cast<std::size_t>(std::atoll(argv[3])) : 200;
+    std::size_t k = 10;
+
+    std::printf("# liblistofclusters microbenchmarks\n");
+    std::printf("#   dataset: N=%zu, D=%zu, uniform [-1, 1]\n", N, D);
+    std::printf("#   queries: Q=%zu, k=%zu\n", Q, k);
+    std::printf("#   index:   bucket_size=16, overflow=64\n");
+    std::printf("#\n");
+
+    const auto db      = make_dataset(N, D, /*seed=*/42);
+    const auto queries = make_dataset(Q, D, /*seed=*/9999);
+
+    print_header();
+
+    // 1. Build (insert all N).
+    {
+        const Stats s = bench_insert(db, /*repeats=*/5);
+        print_row("insert (LC)", N, s);
+    }
+    // 2. kNN throughput (LC).
+    {
+        const Stats s = bench_knn(db, queries, k, /*repeats=*/5);
+        print_row("knn k=10 (LC)", Q, s);
+    }
+    // 3. kNN throughput (brute force baseline).
+    {
+        const Stats s = bench_knn_brute(db, queries, k, /*repeats=*/3);
+        print_row("knn k=10 (brute force)", Q, s);
+    }
+    // 4. Range search (LC). Radius picked to yield ~5-15 results on uniform data.
+    {
+        const double radius = 0.4;
+        const Stats s = bench_range(db, queries, radius, /*repeats=*/5);
+        std::string lbl = "range r=0.4 (LC)";
+        print_row(lbl, Q, s);
+    }
+    // 5. Recall@k sanity check.
+    {
+        const double r = recall_at_k(db, std::vector<vec_t>(queries.begin(), queries.begin() + std::min<std::size_t>(50, Q)), k);
+        std::printf("\nrecall@%zu vs brute force (50 queries): %.3f\n", k, r);
+    }
+
+    return 0;
+}

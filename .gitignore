@@ -33,3 +33,4 @@ __pycache__/
 .idea/
 *.swp
 tests/test_smoke_nosan
+bench/bench_main
