@@ -1,9 +1,9 @@
 #ifndef _METRIC_LISTOFCLUSTERS_HH_
 #define _METRIC_LISTOFCLUSTERS_HH_
-#include <glob.hh>
-#include <cluster.hh>
-#include <resultslist.hh>
-#include <internal_object.hh>
+#include <listofclusters/glob.hh>
+#include <listofclusters/cluster.hh>
+#include <listofclusters/resultslist.hh>
+#include <listofclusters/internal_object.hh>
 
 namespace metric
 {

@@ -1,6 +1,6 @@
 CXX?=g++
 CXXFLAGS?=-Wall -Wextra -g -ggdb -O2 -std=c++23
-INCLUDE=-I../include/
+INCLUDE=-I../../include/
 LDLIBS=-larmadillo
 TARGET=dbscan
 

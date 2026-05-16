@@ -1,4 +1,4 @@
-#include <listofclusters.hh>
+#include <listofclusters/listofclusters.hh>
 
 #include <algorithm>
 #include <cassert>

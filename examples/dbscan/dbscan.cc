@@ -1,5 +1,5 @@
-#include <listofclusters.hh>
-#include <resultslist.hh>
+#include <listofclusters/listofclusters.hh>
+#include <listofclusters/resultslist.hh>
 #include <armadillo>
 #include <iostream>
 #include <random>

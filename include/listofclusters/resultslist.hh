@@ -1,6 +1,6 @@
 #ifndef _METRIC_RESULTSLIST_HH_
 #define _METRIC_RESULTSLIST_HH_
-#include <internal_object.hh>
+#include <listofclusters/internal_object.hh>
 
 namespace metric
 {

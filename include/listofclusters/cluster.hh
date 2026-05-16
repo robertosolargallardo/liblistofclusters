@@ -1,7 +1,7 @@
 #ifndef _METRIC_CLUSTER_HH_
 #define _METRIC_CLUSTER_HH_
-#include <glob.hh>
-#include <internal_object.hh>
+#include <listofclusters/glob.hh>
+#include <listofclusters/internal_object.hh>
 
 namespace metric
 {
