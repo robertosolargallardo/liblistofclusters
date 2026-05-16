@@ -1,0 +1,34 @@
+graphify-out/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+compile_commands.json
+
+# Test binaries (no extension)
+tests/test_smoke
+
+# Example binaries (built in their own dirs)
+examples/cache/cache
+examples/dbscan/dbscan
+examples/baseline_brute_force/all2all
+examples/baseline_brute_force/baseline_brute_force
+
+# CMake build dirs
+build/
+cmake-build-*/
+
+# Python wrapper build artifacts
+python/build/
+python/dist/
+python/*.egg-info/
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+*.swp

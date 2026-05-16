@@ -11,10 +11,12 @@ template<class internal_object_t>
 class compare
 {
 public:
-    bool operator()(const internal_object_t &_a,const internal_object_t &_b) const
+    bool operator()(const internal_object_t &_a,const internal_object_t &_b) const noexcept
     {
+        // Treat objects with the same id as equivalent (dedup-by-id semantics)
         if(_a.id()==_b.id()) return(false);
-        return(_a.distance()<=_b.distance());
+        // Order by distance, breaking ties on id to satisfy strict weak ordering
+        return(std::tuple{_a.distance(),_a.id()} < std::tuple{_b.distance(),_b.id()});
     }
 };
 
@@ -22,43 +24,21 @@ template<class object_t>
 class internal_object
 {
 private:
-    uint32_t _id;
-    object_t _object;
-    double   _distance;
-    bool     _ghost;
+    uint32_t _id{0U};
+    object_t _object{};
+    double   _distance{0.0};
+    bool     _ghost{true};
 
 public:
-    internal_object(void)
-    {
-        this->_ghost=true;
-        this->_distance=0.0;
-    }
-    internal_object(const internal_object &_internal_object)
-    {
-        this->_id=_internal_object._id;
-        this->_object=_internal_object._object;
-        this->_distance=_internal_object._distance;
-        this->_ghost=_internal_object._ghost;
-    }
+    internal_object(void) = default;
+    internal_object(const internal_object&) = default;
+    internal_object(internal_object&&) noexcept = default;
+    internal_object& operator=(const internal_object&) = default;
+    internal_object& operator=(internal_object&&) noexcept = default;
+    ~internal_object(void) = default;
+
     internal_object(const object_t &_object,const uint32_t &_id,const double &_distance=0.0)
-    {
-        this->_id=_id;
-        this->_object=_object;
-        this->_distance=_distance;
-        this->_ghost=false;
-    }
-    internal_object& operator=(const internal_object &_internal_object)
-    {
-        this->_id=_internal_object._id;
-        this->_object=_internal_object._object;
-        this->_distance=_internal_object._distance;
-        this->_ghost=_internal_object._ghost;
-        return(*this);
-    }
-    ~internal_object(void)
-    {
-        ;
-    }
+        : _id(_id), _object(_object), _distance(_distance), _ghost(false) {}
     uint32_t id(void) const
     {
         return(this->_id);

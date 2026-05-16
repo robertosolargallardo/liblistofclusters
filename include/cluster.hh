@@ -14,17 +14,19 @@ public:
     typedef std::set<internal_object_t,compare<internal_object_t>> bucket_t;
 
 private:
-    uint32_t  _id;
-    internal_object_t  _centroid;
-    bucket_t  _bucket;
-    double    _radius;
+    uint32_t  _id{0U};
+    internal_object_t  _centroid{};
+    bucket_t  _bucket{};
+    double    _radius{0.0};
 
 
 public:
-    cluster(void);
-    cluster(const cluster&);
-    cluster& operator=(const cluster&);
-    ~cluster(void);
+    cluster(void) = default;
+    cluster(const cluster&) = default;
+    cluster(cluster&&) noexcept = default;
+    cluster& operator=(const cluster&) = default;
+    cluster& operator=(cluster&&) noexcept = default;
+    ~cluster(void) = default;
 
     cluster(const uint32_t&,const internal_object_t&);
 
@@ -44,42 +46,9 @@ public:
     void clear(void);
 };
 template<class object_t>
-cluster<object_t>::cluster(void)
-{
-    this->_radius=0.0;
-}
-
-template<class object_t>
-cluster<object_t>::cluster(const cluster &_cluster)
-{
-    this->_id=_cluster._id;
-    this->_centroid=_cluster._centroid;
-    this->_bucket=_cluster._bucket;
-    this->_radius=_cluster._radius;
-}
-
-template<class object_t>
-cluster<object_t>& cluster<object_t>::operator=(const cluster &_cluster)
-{
-    this->_id=_cluster._id;
-    this->_centroid=_cluster._centroid;
-    this->_bucket=_cluster._bucket;
-    this->_radius=_cluster._radius;
-    return(*this);
-}
-
-template<class object_t>
-cluster<object_t>::~cluster(void)
-{
-    this->_bucket.clear();
-}
-
-template<class object_t>
 cluster<object_t>::cluster(const uint32_t &_id,const internal_object_t &_centroid)
+    : _id(_id), _centroid(_centroid)
 {
-    this->_id=_id;
-    this->_centroid=_centroid;
-    this->_radius=0.0;
 }
 
 template<class object_t>
