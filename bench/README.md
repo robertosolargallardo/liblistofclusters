@@ -48,7 +48,6 @@ insert (LC, incremental)              10000        0.758          1.319
 insert (LC, bulk_build)               10000        1.868          0.535
 knn k=10 (LC incr, 1T)                  200       10.729          0.093
 knn k=10 (LC bulk, 1T)                  200       12.089          0.083
-knn k=10 (LC incr+blocks, 1T)           200       10.893          0.092
 knn k=10 (LC incr, SIMD, 1T)            200        9.853          0.101
 knn k=10 (LC batch, 10T)                200        2.824          0.354
 knn k=10 (brute force, 1T)              200       16.377          0.061

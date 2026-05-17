@@ -31,21 +31,8 @@ public:
     typedef cluster<object_t>         cluster_t;
     typedef std::vector<cluster_t>    list_t;
 
-    // A block summarizes a contiguous range of clusters in _list. At query
-    // time one d(query, pivot) per block decides whether the whole block can
-    // be skipped (when the query ball is fully outside the block's bounding
-    // ball). Built on demand via build_block_index() or auto-built at the
-    // end of bulk_build().
-    struct block_t {
-        internal_object_t pivot;     // representative point (first cluster's centroid)
-        double            radius;    // covers every (centroid + cluster_radius) in this block
-        std::size_t       start;     // first cluster index in _list
-        std::size_t       count;     // number of clusters in this block
-    };
-
 private:
     list_t                 _list;
-    std::vector<block_t>   _blocks; // empty -> search falls back to flat scan
     uint32_t               _cid{0U};
     [[no_unique_address]] distance_t _metric{};
 
@@ -84,33 +71,9 @@ public:
     // pruning fires more often at query time. Trades build time for query
     // time, as the paper intends.
     //
-    // `use_pivots`: when true, additionally chooses a second reference point
-    // (the bucket member farthest from the centroid) per cluster and stores
-    // d(pivot, member) for every bucket member. At search time both bounds
-    // are used for triangle-inequality pruning. The extra `d(query, pivot)`
-    // distance call per cluster pays for itself only when the per-distance
-    // cost is high (high D, expensive metric). For cheap metrics in low D
-    // (Euclidean on small float vectors) it tends to be a slight net loss,
-    // so the default is false.
-    //
     // Replaces any existing index state (clear() is called first).
     void bulk_build(const std::vector<object_t> &objs,
-                    const std::vector<uint32_t> &ids,
-                    bool use_pivots = false);
-
-    // Build (or rebuild) a two-tier block index over the current flat
-    // cluster list. Each block summarizes `block_size` (default sqrt(N))
-    // consecutive clusters with a pivot + bounding radius; at query time a
-    // single d(query, pivot) per block can prune the whole block.
-    //
-    // OPT-IN. Empirically this does not help (and sometimes slightly hurts)
-    // workloads where consecutive clusters aren't spatially close, which is
-    // the typical case under LC's order-dependent invariant. Useful as a
-    // building block for callers with workloads where their insertion
-    // sequence happens to be spatially coherent; otherwise leave it off.
-    //
-    // Cleared by clear().
-    void build_block_index(std::size_t block_size = 0);
+                    const std::vector<uint32_t> &ids);
 
     // Queries are read-only with respect to the index: they only touch _list
     // and the (stateless) metric. Multiple knn_search/range_search/batch_knn
@@ -212,55 +175,7 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::clear(void) noexcept
 {
     this->_list.clear();
-    this->_blocks.clear();
     this->_cid = 0U;
-}
-
-// ---------------------------------------------------------------------------
-// build_block_index - construct the two-tier block index over _list.
-//
-// Each block summarizes a contiguous range of clusters with one pivot
-// (taken as the first cluster's centroid in the block) and a radius
-// that covers every (centroid + cluster_radius) in the block. At search
-// time one distance call per block can prune the whole block. Effective
-// when blocks happen to be spatially tight, which holds when consecutive
-// LC clusters come from nearby regions (bulk_build's "first unassigned"
-// center selection tends to produce this).
-// ---------------------------------------------------------------------------
-template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
-    requires Metric<distance_t, object_t>
-void listofclusters<object_t,distance_t,bucket_size,overflow>::build_block_index(std::size_t block_size)
-{
-    this->_blocks.clear();
-    const std::size_t nclusters = this->_list.size();
-    if (nclusters == 0) return;
-
-    if (block_size == 0) {
-        // sqrt(N) blocks - balances "blocks visited" vs "per-block work".
-        const std::size_t s = static_cast<std::size_t>(std::sqrt(static_cast<double>(nclusters)));
-        block_size = std::max<std::size_t>(s, 4);
-    }
-
-    this->_blocks.reserve(nclusters / block_size + 1);
-    for (std::size_t start = 0; start < nclusters; start += block_size) {
-        const std::size_t end = std::min(start + block_size, nclusters);
-        const cluster_t &first = this->_list[start];
-        block_t b;
-        b.pivot = first.centroid();
-        b.start = start;
-        b.count = end - start;
-        // Block radius: max over members of (d(pivot, member_centroid) + member_radius).
-        // For the first cluster, that distance is 0.
-        double r = first.radius();
-        for (std::size_t i = start + 1; i < end; ++i) {
-            const cluster_t &c = this->_list[i];
-            const double dpc = this->_metric(b.pivot.object(), c.centroid().object());
-            const double covered = dpc + c.radius();
-            if (covered > r) r = covered;
-        }
-        b.radius = r;
-        this->_blocks.push_back(std::move(b));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +227,7 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
     const std::vector<object_t> &objs,
-    const std::vector<uint32_t> &ids,
-    bool use_pivots)
+    const std::vector<uint32_t> &ids)
 {
     this->clear();
     const std::size_t n = std::min(objs.size(), ids.size());
@@ -370,30 +284,6 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
                 }
             remaining -= take;
 
-            // 5. Optional pivot for tighter triangle-inequality pruning at
-            //    query time. The farthest bucket member from the centroid
-            //    maximizes the "lever arm" of the pivot bound. Compute
-            //    d(pivot, m) for every OTHER bucket member and stash on the
-            //    cluster. Opt-in via `use_pivots` because at low D / cheap
-            //    metrics the extra d(query, pivot) per cluster outweighs
-            //    the savings.
-            if (use_pivots && take >= 2) {
-                const std::size_t pivot_idx_in_scratch = take - 1;
-                const std::size_t pivot_obj_idx = scratch[pivot_idx_in_scratch].second;
-                std::vector<double> pivot_dists;
-                pivot_dists.reserve(take);
-                for (std::size_t i = 0; i < take; ++i) {
-                    const std::size_t mem_obj_idx = scratch[i].second;
-                    if (mem_obj_idx == pivot_obj_idx)
-                        pivot_dists.push_back(0.0);
-                    else
-                        pivot_dists.push_back(this->_metric(objs[pivot_obj_idx], objs[mem_obj_idx]));
-                }
-                cluster.set_pivot(
-                    internal_object_t(objs[pivot_obj_idx], ids[pivot_obj_idx]),
-                    pivot_dists);
-            }
-
             this->_list.push_back(std::move(cluster));
         }
 }
@@ -415,14 +305,8 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resultslist_t &_results, const double &_radius) const
 {
-    // Hoist query object out of the resultslist getter so each iteration
-    // does not chase the centroid()/.object() chain.
     const object_t &q = _results.centroid().object();
     const uint32_t qid = _results.centroid().id();
-
-    // Two-tier path: when the block index is available, an outer loop over
-    // blocks lets one d(query, block.pivot) prune ~sqrt(N) clusters at a time.
-    const bool tiered = !this->_blocks.empty();
     const std::size_t nclusters = this->_list.size();
 
     auto process_cluster = [&](const cluster_t &c) -> bool {
@@ -434,23 +318,10 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
                     if(d <= _radius && !cc.ghost() && cc.id() != qid)
                         _results.push(cc.object(), cc.id(), d);
 
-                    const bool use_pivot = c.has_pivot();
-                    bool dp_set = false;
-                    double dp = 0.0;
-
                     for(const auto &o : c.bucket())
                         {
                             if((d - _radius) > o.distance() || (d + _radius) < o.distance())
                                 continue;
-                            if (use_pivot) {
-                                if (!dp_set) {
-                                    dp = this->_metric(q, c.pivot().object());
-                                    dp_set = true;
-                                }
-                                const double pd = o.pivot_distance();
-                                if((dp - _radius) > pd || (dp + _radius) < pd)
-                                    continue;
-                            }
                             const double md = this->_metric(q, o.object());
                             if(md <= _radius && o.id() != qid)
                                 _results.push(o.object(), o.id(), md);
@@ -461,20 +332,6 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
             return ((d + _radius) <= c.radius());
         };
 
-    if (tiered) {
-        for (const auto &b : this->_blocks) {
-            const double d_qp = this->_metric(q, b.pivot.object());
-            if (d_qp > _radius + b.radius)
-                continue;  // entire block can't intersect the query ball
-            const std::size_t end = b.start + b.count;
-            for (std::size_t i = b.start; i < end; ++i) {
-                if (process_cluster(this->_list[i])) return;
-            }
-        }
-        return;
-    }
-
-    // Flat scan fallback (no block index built yet).
     for (std::size_t i = 0; i < nclusters; ++i) {
         if (process_cluster(this->_list[i])) return;
     }
@@ -494,23 +351,10 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::explore(resultsli
     if(dqc <= _radius && !cc.ghost() && cc.id() != qid)
         _results.push(cc.object(), cc.id(), dqc);
 
-    const bool use_pivot = _cluster.has_pivot();
-    bool dqp_set = false;
-    double dqp = 0.0;
-
     for(const auto &o : _cluster.bucket())
         {
             if((dqc - _radius) > o.distance() || (dqc + _radius) < o.distance())
                 continue;
-            if (use_pivot) {
-                if (!dqp_set) {
-                    dqp = this->_metric(q, _cluster.pivot().object());
-                    dqp_set = true;
-                }
-                const double pd = o.pivot_distance();
-                if((dqp - _radius) > pd || (dqp + _radius) < pd)
-                    continue;
-            }
             const double d = this->_metric(q, o.object());
             if(d <= _radius && o.id() != qid)
                 _results.push(o.object(), o.id(), d);
@@ -559,21 +403,9 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
 
             // 2. Explore bucket if the query ball intersects this cluster.
             if ((d - radius) <= c.radius()) {
-                const bool use_pivot = c.has_pivot();
-                bool dp_set = false;
-                double dp = 0.0;
                 for (const auto &m : c.bucket()) {
                     if ((d - radius) > m.distance() || (d + radius) < m.distance())
                         continue;
-                    if (use_pivot) {
-                        if (!dp_set) {
-                            dp = this->_metric(q, c.pivot().object());
-                            dp_set = true;
-                        }
-                        const double pd = m.pivot_distance();
-                        if ((dp - radius) > pd || (dp + radius) < pd)
-                            continue;
-                    }
                     const double md = this->_metric(q, m.object());
                     if (md < radius && m.id() != qid) {
                         results.push(m.object(), m.id(), md);
@@ -584,21 +416,6 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
             return ((d + radius) <= c.radius());
         };
 
-    if (!this->_blocks.empty()) {
-        // Two-tier path: a single d(q, block.pivot) can skip ~sqrt(N) clusters.
-        for (const auto &b : this->_blocks) {
-            const double d_qp = this->_metric(q, b.pivot.object());
-            if (d_qp > radius + b.radius)
-                continue;
-            const std::size_t end = b.start + b.count;
-            for (std::size_t i = b.start; i < end; ++i) {
-                if (process_cluster(this->_list[i])) return results;
-            }
-        }
-        return results;
-    }
-
-    // Flat scan fallback.
     for (const auto &c : this->_list) {
         if (process_cluster(c)) break;
     }

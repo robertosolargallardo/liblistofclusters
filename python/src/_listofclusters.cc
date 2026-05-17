@@ -53,7 +53,7 @@ public:
     virtual void remove(const vec_t&, std::uint32_t) = 0;
     virtual void batch_insert(const std::vector<vec_t>&, const std::vector<std::uint32_t>&) = 0;
     virtual void batch_remove(const std::vector<vec_t>&, const std::vector<std::uint32_t>&) = 0;
-    virtual void bulk_build(const std::vector<vec_t>&, const std::vector<std::uint32_t>&, bool use_pivots) = 0;
+    virtual void bulk_build(const std::vector<vec_t>&, const std::vector<std::uint32_t>&) = 0;
     virtual std::pair<std::vector<std::uint32_t>, std::vector<double>>
         knn(const vec_t&, std::size_t k) = 0;
     virtual std::pair<std::vector<std::uint32_t>, std::vector<double>>
@@ -93,8 +93,8 @@ public:
     void batch_remove(const std::vector<vec_t>& objs, const std::vector<std::uint32_t>& ids) override {
         _idx.remove(objs, ids);
     }
-    void bulk_build(const std::vector<vec_t>& objs, const std::vector<std::uint32_t>& ids, bool use_pivots) override {
-        _idx.bulk_build(objs, ids, use_pivots);
+    void bulk_build(const std::vector<vec_t>& objs, const std::vector<std::uint32_t>& ids) override {
+        _idx.bulk_build(objs, ids);
     }
 
     std::pair<std::vector<std::uint32_t>, std::vector<double>>
@@ -262,13 +262,12 @@ NB_MODULE(_listofclusters, m)
         .def("bulk_build",
             [](IndexBase& self,
                nb::ndarray<const double, nb::ndim<2>, nb::c_contig> V,
-               nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> ids,
-               bool use_pivots) {
+               nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig> ids) {
                 if (V.shape(0) != ids.shape(0))
                     throw std::invalid_argument("V.shape[0] must equal ids.shape[0]");
-                self.bulk_build(to_vec2d(V), to_ids(ids), use_pivots);
+                self.bulk_build(to_vec2d(V), to_ids(ids));
             },
-            nb::arg("V"), nb::arg("ids"), nb::arg("use_pivots") = false,
+            nb::arg("V"), nb::arg("ids"),
             "Canonical LC construction. Replaces any existing index state.")
 
         // kNN, single query. Returns (ids, dists) tuple.

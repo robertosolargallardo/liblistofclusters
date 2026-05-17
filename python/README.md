@@ -44,7 +44,7 @@ batch_nbrs, batch_dists = idx.batch_knn(Q, k=10, nthreads=0)  # 0 = HW threads
 | Batch insert | `idx.insert_batch(V, ids)` |
 | Online remove | `idx.remove(v, id)` |
 | Batch remove | `idx.remove_batch(V, ids)` |
-| Bulk build (replaces state) | `idx.bulk_build(V, ids, use_pivots=False)` |
+| Bulk build (replaces state) | `idx.bulk_build(V, ids)` |
 | kNN query | `nbrs, dists = idx.knn(q, k=10)` |
 | Range query | `nbrs, dists = idx.range(q, radius)` |
 | Parallel batch kNN | `nbrs, dists = idx.batch_knn(Q, k=10, nthreads=0)` |

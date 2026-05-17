@@ -451,52 +451,6 @@ static void test_more_builtin_metrics()
               << metric::available_metrics_count << " entries)\n";
 }
 
-// bulk_build with use_pivots=true must yield the same recall-1.0 kNN as the
-// default (no pivots) - the pivot path is a pruning optimization, not a
-// correctness change.
-static void test_bulk_build_with_pivots()
-{
-    constexpr std::uint32_t N = 200U;
-    constexpr std::size_t D = 6U;
-    constexpr std::size_t k = 5U;
-
-    std::vector<vec_t> db(N);
-    std::vector<std::uint32_t> ids(N);
-    std::mt19937 rng(91);
-    std::uniform_real_distribution<double> u(-1.0, 1.0);
-    for (std::uint32_t i = 0; i < N; ++i) {
-        db[i].resize(D);
-        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
-        ids[i] = i;
-    }
-
-    idx_t idx;
-    idx.bulk_build(db, ids, /*use_pivots=*/true);
-
-    int hits = 0, expected = 0;
-    for (int q = 0; q < 10; ++q) {
-        vec_t query(D);
-        for (std::size_t j = 0; j < D; ++j) query[j] = u(rng);
-        std::vector<std::pair<double, std::uint32_t>> bf;
-        bf.reserve(N);
-        for (std::uint32_t i = 0; i < N; ++i) bf.emplace_back(bf_dist(query, db[i]), i);
-        std::sort(bf.begin(), bf.end());
-        std::vector<std::uint32_t> want;
-        for (std::size_t i = 0; i < k; ++i) want.push_back(bf[i].second);
-        auto res = idx.knn_search(query, N + q, k);
-        std::vector<std::uint32_t> got;
-        for (const auto &r : res.results()) got.push_back(r.id());
-        std::sort(want.begin(), want.end());
-        std::sort(got.begin(), got.end());
-        for (auto id : want) {
-            if (std::find(got.begin(), got.end(), id) != got.end()) ++hits;
-            ++expected;
-        }
-    }
-    assert(hits == expected && "pivot-augmented bulk_build missed brute-force neighbors");
-    std::cout << "  test_bulk_build_with_pivots: OK (" << hits << "/" << expected << " recall)\n";
-}
-
 // Batch remove should leave the index in the same state as a serial loop
 // of remove() calls and removed ids must no longer be retrievable.
 static void test_batch_remove()
@@ -557,7 +511,6 @@ int main()
     test_builtin_metrics();
     test_more_builtin_metrics();
     test_batch_remove();
-    test_bulk_build_with_pivots();
     std::cout << "all tests passed\n";
     return 0;
 }

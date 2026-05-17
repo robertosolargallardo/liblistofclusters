@@ -276,33 +276,6 @@ bench_knn_bulk(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
     return summarize(std::move(samples_ns), queries.size());
 }
 
-// kNN throughput against an incrementally-built index that ALSO has the
-// block index (built explicitly after the inserts). Isolates the block
-// index speedup from the bulk_build cluster-shape benefit.
-[[nodiscard]] static Stats
-bench_knn_incr_blocked(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
-                       std::size_t k, int repeats)
-{
-    idx_t<> idx;
-    for (std::uint32_t i = 0; i < db.size(); ++i) idx.insert(db[i], i);
-    idx.build_block_index();
-
-    std::vector<double> samples_ns;
-    samples_ns.reserve(repeats);
-    volatile std::size_t sink = 0;
-    for (int r = 0; r < repeats; ++r) {
-        const double ns = time_ns([&] {
-            for (std::uint32_t q = 0; q < queries.size(); ++q) {
-                auto res = idx.knn_search(queries[q], static_cast<std::uint32_t>(db.size() + q), k);
-                sink += res.results().size();
-            }
-        });
-        samples_ns.push_back(ns);
-    }
-    (void)sink;
-    return summarize(std::move(samples_ns), queries.size());
-}
-
 // kNN LC with the explicit NEON/AVX2 Euclidean (vs the auto-vec scalar).
 [[nodiscard]] static Stats
 bench_knn_simd(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
@@ -1111,12 +1084,6 @@ int main(int argc, char **argv)
     //     two build strategies.
     const Stats s_knn_bulk = bench_knn_bulk(db, queries, k, /*repeats=*/5);
     print_row("knn k=10 (LC bulk, 1T)", Q, s_knn_bulk);
-
-    // 2b. Incremental build + explicit build_block_index (the HC-style
-    //     two-tier index). Opt-in: empirically a regression on the workloads
-    //     in this bench, kept here so the cost is visible.
-    const Stats s_knn_blocked = bench_knn_incr_blocked(db, queries, k, /*repeats=*/5);
-    print_row("knn k=10 (LC incr+blocks, 1T)", Q, s_knn_blocked);
 
     // 2c. kNN with the explicit NEON/AVX2 Euclidean. Same incremental build,
     //     only the metric functor differs from row 2.
