@@ -4,9 +4,16 @@
 #include <listofclusters/cluster.hh>
 #include <listofclusters/resultslist.hh>
 #include <listofclusters/internal_object.hh>
+#include <listofclusters/detail/batched_distance.hh>
+#include <numeric>
+#include <span>
 
 namespace metric
 {
+
+// Forward declared so the LC class can friend it (used by tests + bench to
+// inspect private side structures without leaking _debug_* accessors).
+template <class O, class M, std::size_t B, std::size_t V> class lc_test_access;
 
 // Fixed-bucket-size List of Clusters metric index
 // (Chavez & Navarro, "A compact space decomposition for effective metric
@@ -31,10 +38,23 @@ public:
     typedef cluster<object_t>         cluster_t;
     typedef std::vector<cluster_t>    list_t;
 
+    // Side structure: contiguous row-major matrix of cluster centroids.
+    // Kept in sync with _list and rebuilt lazily on the first query that
+    // needs it (or eagerly via freeze()). Invalidated by insert/remove.
+    struct centers_soa_t {
+        std::vector<double> data;
+        std::size_t         dim   = 0;
+        std::size_t         n     = 0;
+        bool                stale = true;
+    };
+
 private:
+    template <class O, class M, std::size_t B, std::size_t V> friend class lc_test_access;
+
     list_t                 _list;
     uint32_t               _cid{0U};
     [[no_unique_address]] distance_t _metric{};
+    mutable centers_soa_t  _centers;
 
 public:
     listofclusters(void) = default;
@@ -96,6 +116,11 @@ public:
     [[nodiscard]] size_t size(void) const noexcept { return _list.size(); }
     [[nodiscard]] bool empty(void) const noexcept { return _list.empty(); }
 
+    // Eagerly build (or refresh) all side structures. Useful for purely-online
+    // callers that don't call bulk_build but want to amortize the first-query
+    // rebuild cost.
+    void freeze();
+
     void centroids(std::ostream &os = std::cout) const
     {
         for(const auto& c : this->_list)
@@ -105,6 +130,7 @@ public:
 private:
     void range_search(resultslist_t&, const double&) const;
     void explore(resultslist_t&, const cluster_t&, const double&) const;
+    void refresh_centers_soa_() const;
 
     static_assert(overflow >= bucket_size,
                   "overflow must be >= bucket_size (legacy invariant)");
@@ -124,6 +150,7 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::insert(const object_t &_object, const uint32_t &_id)
 {
+    this->_centers.stale = true;
     object_t obj = _object;
     uint32_t id  = _id;
 
@@ -157,6 +184,7 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::remove(const object_t &_object, const uint32_t &_id)
 {
+    this->_centers.stale = true;
     for(auto it = this->_list.begin(); it != this->_list.end(); ++it)
         {
             const double d = this->_metric(_object, it->centroid().object());
@@ -176,6 +204,7 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::clear(void) noexc
 {
     this->_list.clear();
     this->_cid = 0U;
+    this->_centers = centers_soa_t{};
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +315,8 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
 
             this->_list.push_back(std::move(cluster));
         }
+
+    this->refresh_centers_soa_();
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +502,41 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
     }
     for (auto &t : ts) t.join();
     return results;
+}
+
+// ---------------------------------------------------------------------------
+// refresh_centers_soa_ — rebuild flat SoA of cluster centroids from _list.
+// Called by bulk_build, and lazily by query paths when _centers.stale is true.
+// ---------------------------------------------------------------------------
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::refresh_centers_soa_() const
+{
+    const std::size_t n = this->_list.size();
+    _centers.n = n;
+    if (n == 0) {
+        _centers.data.clear();
+        _centers.dim = 0;
+        _centers.stale = false;
+        return;
+    }
+    const auto &first = this->_list[0].centroid().object();
+    const std::size_t dim = std::size(first);
+    _centers.dim = dim;
+    _centers.data.assign(n * dim, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto &obj = this->_list[i].centroid().object();
+        for (std::size_t j = 0; j < dim; ++j)
+            _centers.data[i * dim + j] = static_cast<double>(obj[j]);
+    }
+    _centers.stale = false;
+}
+
+template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
+    requires Metric<distance_t, object_t>
+void listofclusters<object_t,distance_t,bucket_size,overflow>::freeze()
+{
+    this->refresh_centers_soa_();
 }
 
 }  // namespace metric

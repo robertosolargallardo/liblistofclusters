@@ -33,6 +33,22 @@ struct euclid {
 
 using idx_t = metric::listofclusters<vec_t, euclid, 4, 10>;
 
+// Test-only accessor for private side structures. Friended into listofclusters
+// (see the forward declaration in listofclusters.hh) so tests can inspect
+// _centers, _list, etc. without leaking _debug_* methods into the public API.
+namespace metric {
+template <class O, class M, std::size_t B, std::size_t V>
+class lc_test_access
+{
+public:
+    using idx_type = listofclusters<O, M, B, V>;
+    static const auto& centers_soa(const idx_type &i) noexcept { return i._centers; }
+    static const auto& list(const idx_type &i) noexcept { return i._list; }
+};
+}  // namespace metric
+
+using lc_access = metric::lc_test_access<vec_t, euclid, 4, 10>;
+
 static void test_build_and_knn()
 {
     idx_t idx;
@@ -528,10 +544,51 @@ static void test_scalar_batched_distance()
     std::cout << "  test_scalar_batched_distance: OK\n";
 }
 
+// Phase 1.2: centers_soa is consistent with _list after bulk_build; stale flag
+// flips on insert and is cleared on next freeze()/query.
+static void test_centers_soa_consistency()
+{
+    constexpr std::uint32_t N = 50U;
+    constexpr std::size_t D = 4U;
+
+    std::vector<vec_t> db(N);
+    std::vector<std::uint32_t> ids(N);
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        ids[i] = i;
+    }
+
+    idx_t idx;
+    idx.bulk_build(db, ids);
+
+    const auto &soa = lc_access::centers_soa(idx);
+    const auto &list = lc_access::list(idx);
+    assert(!soa.stale);
+    assert(soa.n == list.size());
+    assert(soa.dim == D);
+    for (std::size_t i = 0; i < list.size(); ++i)
+        for (std::size_t j = 0; j < D; ++j)
+            assert(soa.data[i * D + j] == list[i].centroid().object()[j]);
+
+    // Stale flag must flip on online edit.
+    idx.insert(db[0], 9999U);
+    assert(lc_access::centers_soa(idx).stale);
+
+    // freeze() rebuilds and clears stale.
+    idx.freeze();
+    assert(!lc_access::centers_soa(idx).stale);
+
+    std::cout << "  test_centers_soa_consistency: OK (n=" << soa.n << ", dim=" << soa.dim << ")\n";
+}
+
 int main()
 {
     std::cout << "liblistofclusters smoke tests:\n";
     test_scalar_batched_distance();
+    test_centers_soa_consistency();
     test_build_and_knn();
     test_range_search();
     test_equal_distance_strict_weak_ordering();
