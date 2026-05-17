@@ -544,6 +544,69 @@ static void test_scalar_batched_distance()
     std::cout << "  test_scalar_batched_distance: OK\n";
 }
 
+// Phase 2.2: SIMD batched euclidean kernel must match the scalar functor
+// on every row of a centers matrix. ULP-tolerant comparison to allow for
+// FMA-induced rounding differences.
+static void test_simd_batched_euclidean_matches_scalar()
+{
+    using v_t = std::vector<double>;
+    const std::size_t dim = 8, n = 64;
+    std::vector<double> centers(n * dim);
+    std::mt19937 rng(1);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (auto &x : centers) x = u(rng);
+    v_t q(dim);
+    for (auto &x : q) x = u(rng);
+
+    auto simd = metric::detail::batched_distance(
+        metric::euclidean{}, q,
+        std::span<const double>(centers.data(), centers.size()), dim, n);
+
+    metric::euclidean m{};
+    v_t row(dim);
+    auto approx = [](double x, double y) { return std::abs(x - y) < 1e-9; };
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < dim; ++j) row[j] = centers[i * dim + j];
+        assert(approx(simd[i], m(q, row)));
+    }
+    std::cout << "  test_simd_batched_euclidean_matches_scalar: OK (n=" << n << ", dim=" << dim << ")\n";
+}
+
+// Phase 2.3: SIMD L1 / L∞ batched kernels must match the scalar functor.
+static void test_simd_batched_l1_linf_match_scalar()
+{
+    using v_t = std::vector<double>;
+    const std::size_t dim = 8, n = 32;
+    std::vector<double> centers(n * dim);
+    std::mt19937 rng(2);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (auto &x : centers) x = u(rng);
+    v_t q(dim);
+    for (auto &x : q) x = u(rng);
+
+    auto approx = [](double x, double y) { return std::abs(x - y) < 1e-9; };
+    v_t row(dim);
+
+    auto sl1 = metric::detail::batched_distance(
+        metric::manhattan{}, q,
+        std::span<const double>(centers.data(), centers.size()), dim, n);
+    metric::manhattan m1{};
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < dim; ++j) row[j] = centers[i * dim + j];
+        assert(approx(sl1[i], m1(q, row)));
+    }
+
+    auto sli = metric::detail::batched_distance(
+        metric::chebyshev{}, q,
+        std::span<const double>(centers.data(), centers.size()), dim, n);
+    metric::chebyshev mc{};
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < dim; ++j) row[j] = centers[i * dim + j];
+        assert(approx(sli[i], mc(q, row)));
+    }
+    std::cout << "  test_simd_batched_l1_linf_match_scalar: OK\n";
+}
+
 // Phase 1.2: centers_soa is consistent with _list after bulk_build; stale flag
 // flips on insert and is cleared on next freeze()/query.
 static void test_centers_soa_consistency()
@@ -588,6 +651,8 @@ int main()
 {
     std::cout << "liblistofclusters smoke tests:\n";
     test_scalar_batched_distance();
+    test_simd_batched_euclidean_matches_scalar();
+    test_simd_batched_l1_linf_match_scalar();
     test_centers_soa_consistency();
     test_build_and_knn();
     test_range_search();

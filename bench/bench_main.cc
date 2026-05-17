@@ -58,17 +58,9 @@ inline constexpr std::size_t kD = BENCH_D;
 using vec_t  = std::array<double, kD>;
 using clock_t_ = std::chrono::steady_clock;
 
-struct euclid {
-    [[nodiscard]] double operator()(const vec_t &a, const vec_t &b) const noexcept
-    {
-        double s = 0.0;
-        for (std::size_t i = 0; i < kD; ++i) {
-            const double d = a[i] - b[i];
-            s += d * d;
-        }
-        return std::sqrt(s);
-    }
-};
+// Use the library's metric::euclidean so the LC index opts into the trait
+// + per-metric batched_distance SIMD overload from Phase 2.
+using euclid = metric::euclidean;
 
 // bucket_size=20 is the published default ("Engineering efficient metric
 // indexes", Chavez et al.) and empirically best for our N=10k workload.
