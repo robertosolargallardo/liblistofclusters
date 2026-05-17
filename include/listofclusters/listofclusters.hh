@@ -338,33 +338,40 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
 {
     const object_t &q = _results.centroid().object();
     const uint32_t qid = _results.centroid().id();
-    const std::size_t nclusters = this->_list.size();
+    if (this->_list.empty()) return;
 
-    auto process_cluster = [&](const cluster_t &c) -> bool {
-            const internal_object_t &cc = c.centroid();
-            const double d = this->_metric(q, cc.object());
+    auto process_cluster = [&](const cluster_t &c, double d) -> bool {
+        const internal_object_t &cc = c.centroid();
+        if((d - _radius) <= c.radius()) {
+            if(d <= _radius && !cc.ghost() && cc.id() != qid)
+                _results.push(cc.object(), cc.id(), d);
+            for(const auto &o : c.bucket()) {
+                if((d - _radius) > o.distance() || (d + _radius) < o.distance())
+                    continue;
+                const double md = this->_metric(q, o.object());
+                if(md <= _radius && o.id() != qid)
+                    _results.push(o.object(), o.id(), md);
+            }
+        }
+        // LC build-order early-termination invariant (Chavez & Navarro 2005 §4).
+        return ((d + _radius) <= c.radius());
+    };
 
-            if((d - _radius) <= c.radius())
-                {
-                    if(d <= _radius && !cc.ghost() && cc.id() != qid)
-                        _results.push(cc.object(), cc.id(), d);
+    if constexpr (supports_batched_distance_v<distance_t, object_t>) {
+        if (this->_centers.stale) this->refresh_centers_soa_();
+        auto d_centers = detail::batched_distance(
+            this->_metric, q,
+            std::span<const double>(this->_centers.data.data(), this->_centers.data.size()),
+            this->_centers.dim, this->_centers.n);
+        for (std::size_t i = 0; i < this->_centers.n; ++i) {
+            if (process_cluster(this->_list[i], d_centers[i])) return;
+        }
+        return;
+    }
 
-                    for(const auto &o : c.bucket())
-                        {
-                            if((d - _radius) > o.distance() || (d + _radius) < o.distance())
-                                continue;
-                            const double md = this->_metric(q, o.object());
-                            if(md <= _radius && o.id() != qid)
-                                _results.push(o.object(), o.id(), md);
-                        }
-                }
-            // Returns true if the LC early-termination invariant has fired
-            // (query ball totally contained in this cluster).
-            return ((d + _radius) <= c.radius());
-        };
-
-    for (std::size_t i = 0; i < nclusters; ++i) {
-        if (process_cluster(this->_list[i])) return;
+    for (const auto &c : this->_list) {
+        const double d = this->_metric(q, c.centroid().object());
+        if (process_cluster(c, d)) return;
     }
 }
 
@@ -411,6 +418,8 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
     const object_t &q = _object;
     const uint32_t qid = _id;
 
+    if (this->_list.empty()) return results;
+
     // Current pruning radius: the kth-best distance once we've accumulated
     // k results, otherwise infinity.
     double radius = MAX_RADIUS;
@@ -419,38 +428,54 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
             radius = std::prev(results.results().end())->distance();
     };
 
-    // Process one cluster: returns true when the LC early-termination
-    // invariant fires (query ball entirely inside this cluster), telling
-    // the caller to stop walking the list.
-    auto process_cluster = [&](const cluster_t &c) -> bool {
-            const internal_object_t &cc = c.centroid();
-            const double d = this->_metric(q, cc.object());
-
-            // 1. Centroid candidate.
-            if (d < radius && !cc.ghost() && cc.id() != qid) {
-                results.push(cc.object(), cc.id(), d);
-                refresh_radius();
-            }
-
-            // 2. Explore bucket if the query ball intersects this cluster.
-            if ((d - radius) <= c.radius()) {
-                for (const auto &m : c.bucket()) {
-                    if ((d - radius) > m.distance() || (d + radius) < m.distance())
-                        continue;
-                    const double md = this->_metric(q, m.object());
-                    if (md < radius && m.id() != qid) {
-                        results.push(m.object(), m.id(), md);
-                        refresh_radius();
-                    }
+    // Per-cluster walk, sharing the precomputed d(q, centroid_i) passed in.
+    auto process_cluster = [&](const cluster_t &c, double d) -> bool {
+        const internal_object_t &cc = c.centroid();
+        if (d < radius && !cc.ghost() && cc.id() != qid) {
+            results.push(cc.object(), cc.id(), d);
+            refresh_radius();
+        }
+        if ((d - radius) <= c.radius()) {
+            for (const auto &m : c.bucket()) {
+                if ((d - radius) > m.distance() || (d + radius) < m.distance())
+                    continue;
+                const double md = this->_metric(q, m.object());
+                if (md < radius && m.id() != qid) {
+                    results.push(m.object(), m.id(), md);
+                    refresh_radius();
                 }
             }
-            return ((d + radius) <= c.radius());
-        };
+        }
+        return ((d + radius) <= c.radius());
+    };
 
-    for (const auto &c : this->_list) {
-        if (process_cluster(c)) break;
+    // Phase 1 (P1): compute d(q, all_centers) in one batched pass and walk
+    // in insertion order. The batched call wins through contiguous-memory
+    // access (and SIMD overloads in Phase 2). Walk order is INSERTION-ORDER,
+    // not nearest-first, because LC's early-termination invariant
+    // ((d + radius) <= c.radius() ⇒ no later cluster contains qualifying
+    // points) is build-order-dependent (Chavez & Navarro 2005 §4) and breaks
+    // under arbitrary cluster reordering.
+    if constexpr (supports_batched_distance_v<distance_t, object_t>) {
+        if (this->_centers.stale) this->refresh_centers_soa_();
+        auto d_centers = detail::batched_distance(
+            this->_metric, q,
+            std::span<const double>(this->_centers.data.data(), this->_centers.data.size()),
+            this->_centers.dim, this->_centers.n);
+
+        for (std::size_t i = 0; i < this->_centers.n; ++i) {
+            if (process_cluster(this->_list[i], d_centers[i])) break;
+        }
+        return results;
+    } else {
+        // Scalar fallback for non-batched metrics (Levenshtein, custom):
+        // same shape, the metric functor is called per-cluster.
+        for (const auto &c : this->_list) {
+            const double d = this->_metric(q, c.centroid().object());
+            if (process_cluster(c, d)) break;
+        }
+        return results;
     }
-    return results;
 }
 
 // ---------------------------------------------------------------------------
