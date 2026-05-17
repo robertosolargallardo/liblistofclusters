@@ -242,6 +242,35 @@ bench_bulk_build(const std::vector<vec_t> &db, int repeats)
     return summarize(std::move(samples_ns), db.size());
 }
 
+// kNN throughput against an index with AESA-lite enabled (k_anchors anchors).
+[[nodiscard]] static Stats
+bench_knn_aesa(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
+               std::size_t k, std::size_t k_anchors, int repeats)
+{
+    std::vector<std::uint32_t> ids(db.size());
+    for (std::uint32_t i = 0; i < db.size(); ++i) ids[i] = i;
+    idx_t<> idx;
+    idx.bulk_build(db, ids);
+    idx.build_aesa(k_anchors);
+    idx.freeze();
+
+    std::vector<double> samples_ns;
+    samples_ns.reserve(repeats);
+    volatile std::size_t sink = 0;
+    for (int r = 0; r < repeats; ++r) {
+        const double ns = time_ns([&] {
+            for (std::uint32_t q = 0; q < queries.size(); ++q) {
+                auto res = idx.knn_search(queries[q],
+                    static_cast<std::uint32_t>(db.size() + q), k);
+                sink += res.results().size();
+            }
+        });
+        samples_ns.push_back(ns);
+    }
+    (void)sink;
+    return summarize(std::move(samples_ns), queries.size());
+}
+
 // kNN throughput against an index built by bulk_build (vs incremental).
 [[nodiscard]] static Stats
 bench_knn_bulk(const std::vector<vec_t> &db, const std::vector<vec_t> &queries,
@@ -1076,6 +1105,14 @@ int main(int argc, char **argv)
     //     two build strategies.
     const Stats s_knn_bulk = bench_knn_bulk(db, queries, k, /*repeats=*/5);
     print_row("knn k=10 (LC bulk, 1T)", Q, s_knn_bulk);
+
+    // 2a'. AESA-lite at k_anchors=8 and k_anchors=16. Pre-build the table once
+    //      and query repeatedly. Cost: O(N*k) build overhead + k extra distance
+    //      calls per query + tight LB scalar loop per candidate.
+    const Stats s_knn_aesa8  = bench_knn_aesa(db, queries, k,  8, /*repeats=*/5);
+    print_row("knn k=10 (LC AESA k=8, 1T)", Q, s_knn_aesa8);
+    const Stats s_knn_aesa16 = bench_knn_aesa(db, queries, k, 16, /*repeats=*/5);
+    print_row("knn k=10 (LC AESA k=16, 1T)", Q, s_knn_aesa16);
 
     // 2c. kNN with the explicit NEON/AVX2 Euclidean. Same incremental build,
     //     only the metric functor differs from row 2.
