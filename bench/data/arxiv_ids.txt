@@ -1,22 +1,84 @@
 # Pinned arXiv IDs for the bench corpus.
 # Each non-comment line is one arXiv ID. The build_corpus.py script downloads,
 # extracts, chunks, and embeds these into bench/data/embeddings.npy.
-#
-# Vetted starter set: well-known papers in ML / NLP / similarity search.
-# Adjust as needed; SHA256 of each downloaded PDF is recorded in
-# bench/data/pdf_sha256.txt for reproducibility.
+# SHA256 of each downloaded PDF is recorded in bench/data/pdf_sha256.txt.
+
+# --- Transformer / NLP foundations -------------------------------------------
+1409.0473    # Bahdanau attention (RNN encoder-decoder)
+1409.3215    # Sequence-to-sequence learning
+1607.06450   # Layer Normalization
 1706.03762   # Attention is All You Need (transformer)
+1801.06146   # ULMFiT
+1802.05365   # ELMo
 1810.04805   # BERT
-1908.10084   # Sentence-BERT
-2310.19923   # Jina Embeddings 2
-1603.09320   # HNSW (Malkov & Yashunin)
-2007.00808   # DiskANN
-2104.08663   # GPL (dense retrieval pretraining)
 1907.11692   # RoBERTa
-2005.14165   # GPT-3
-1907.10597   # Green AI
-2302.13971   # LLaMA
-2104.13533   # SimCSE
-2309.07597   # BGE / C-Pack
-2204.10628   # Open Pretrained Transformer (OPT)
+1909.11942   # ALBERT
+1910.10683   # T5
+2001.08361   # Neural scaling laws
+2104.09864   # RoPE (rotary embeddings)
+2203.02155   # InstructGPT
+2210.11416   # Flan-T5
+
+# --- Sentence / passage embeddings ------------------------------------------
+1908.10084   # Sentence-BERT
+2104.08821   # SimCSE
+2104.13533   # SimCSE variants / contrastive
 2106.04561   # Contriever
+2104.08663   # GPL
+2202.05144   # nv-embed family
+2309.07597   # BGE / C-Pack
+2310.06825   # Mistral-Embed era
+2310.19923   # Jina Embeddings 2
+2305.11705   # BGE-M3 era
+2402.01030   # follow-up embedding paper era
+
+# --- LLMs / generative -------------------------------------------------------
+2005.14165   # GPT-3
+2204.02311   # PaLM
+2302.13971   # LLaMA
+2307.09288   # LLaMA 2
+2305.10403   # PaLM 2
+
+# --- ANN / vector search / metric indexing ----------------------------------
+1603.09320   # HNSW (Malkov & Yashunin)
+1908.10396   # ScaNN
+2007.00808   # DiskANN
+2104.04915   # FAISS engineering paper
+2009.03300   # FAISS HNSW + IVF integration
+1612.03651   # fastText
+1310.4546    # word2vec
+1607.04606   # fastText (subword)
+1606.04467   # Triplet loss
+
+# --- Retrieval / IR ----------------------------------------------------------
+2004.04906   # DPR (dense passage retrieval)
+2009.14794   # ColBERT
+2210.07316   # ColBERTv2
+
+# --- Vision / multimodal -----------------------------------------------------
+1502.03167   # Batch Normalization
+1505.04597   # U-Net
+1512.03385   # ResNet
+1611.05431   # ResNeXt
+2010.11929   # Vision Transformer (ViT)
+2103.00020   # CLIP
+2103.14030   # Swin Transformer
+2205.11487   # Imagen
+2212.04356   # Whisper
+
+# --- Training / efficiency ---------------------------------------------------
+1412.6980    # Adam optimizer
+1907.10597   # Green AI
+2206.04615   # BigBench
+2204.10628   # Open Pretrained Transformer (OPT)
+2106.09685   # LoRA
+2305.18290   # DPO (direct preference optimization)
+
+# --- Misc influential papers -------------------------------------------------
+1701.06538   # Outrageously large NN (sparsely-gated MoE)
+2202.05144   # NV-embed style
+1706.05587   # DeepLabv3
+1703.06870   # Mask R-CNN
+2305.13245   # GQA grouped-query attention
+2106.04560   # Switch Transformer
+

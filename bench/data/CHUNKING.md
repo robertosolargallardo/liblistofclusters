@@ -8,9 +8,9 @@
   (case-insensitive line match on "References" alone).
 - **Dedup:** skip chunks whose first 64 characters match an earlier chunk
   byte-for-byte (kills boilerplate / repeated paper headers).
-- **Per-paper cap:** at most 200 chunks per paper to keep the corpus
+- **Per-paper cap:** at most 500 chunks per paper to keep the corpus
   balanced across sources.
 
 These rules are implemented in `bench/data/build_corpus.py`. The exact
-chunk count depends on paper lengths; for the default 15-paper starter
-set we get roughly 2000-3000 chunks.
+chunk count depends on paper lengths; the current ~60-paper list yields
+roughly 10000-15000 chunks.

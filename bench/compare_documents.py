@@ -90,15 +90,33 @@ def run_listofclusters(db, queries, k, *, nthreads=1, build_log=None):
     return out
 
 
-def run_faiss_flatip(db, queries, k):
+def _set_faiss_threads(n):
     import faiss
+    # n=0 means "use default" (omp_get_max_threads). For 1-thread comparison
+    # we pin to 1; for HW-thread comparison we leave it at the default.
+    if n > 0:
+        faiss.omp_set_num_threads(n)
+    else:
+        # Restore default to avoid leaking a setting across runs.
+        import os
+        try:
+            faiss.omp_set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 0)) or
+                                       (os.cpu_count() or 1))
+        except Exception:
+            pass
+
+
+def run_faiss_flatip(db, queries, k, threads=1):
+    import faiss
+    _set_faiss_threads(threads)
     index = faiss.IndexFlatIP(db.shape[1])
     index.add(db)
     return index.search(queries, k)[1]
 
 
-def run_faiss_ivf(db, queries, k, nprobe):
+def run_faiss_ivf(db, queries, k, nprobe, threads=1):
     import faiss
+    _set_faiss_threads(threads)
     nlist = max(4, int(np.sqrt(db.shape[0])))
     quant = faiss.IndexFlatIP(db.shape[1])
     index = faiss.IndexIVFFlat(quant, db.shape[1], nlist, faiss.METRIC_INNER_PRODUCT)
@@ -108,13 +126,16 @@ def run_faiss_ivf(db, queries, k, nprobe):
     return index.search(queries, k)[1]
 
 
-def run_hnswlib(db, queries, k, ef):
+def run_hnswlib(db, queries, k, ef, threads=1):
     import hnswlib
+    # hnswlib: threads=0 means "use OpenMP default" in its C++ layer.
+    # threads=1 pins to single-threaded.
+    n = threads if threads > 0 else 0
     index = hnswlib.Index(space="cosine", dim=db.shape[1])
     index.init_index(max_elements=db.shape[0], ef_construction=200, M=16)
-    index.add_items(db)
+    index.add_items(db, num_threads=n)
     index.set_ef(ef)
-    return index.knn_query(queries, k=k)[0]
+    return index.knn_query(queries, k=k, num_threads=n)[0]
 
 
 def main() -> int:
@@ -131,15 +152,22 @@ def main() -> int:
     truth = brute_truth(db, queries, args.k)
 
     rows = []
+    # Threading is controlled explicitly per method so 1T vs HW threads
+    # comparisons are apples-to-apples. Faiss/hnswlib default to OpenMP
+    # max threads, so 1T rows must pin to 1.
     methods = [
-        ("LC, 1T",                  lambda: run_listofclusters(db, queries, args.k, nthreads=1)),
-        ("LC, HW threads",          lambda: run_listofclusters(db, queries, args.k, nthreads=0)),
-        ("faiss.FlatIP",            lambda: run_faiss_flatip(db, queries, args.k)),
-        ("faiss.IVFFlat np=10",     lambda: run_faiss_ivf(db, queries, args.k, 10)),
-        ("faiss.IVFFlat np=32",     lambda: run_faiss_ivf(db, queries, args.k, 32)),
-        ("hnswlib ef=32",           lambda: run_hnswlib(db, queries, args.k, 32)),
-        ("hnswlib ef=64",           lambda: run_hnswlib(db, queries, args.k, 64)),
-        ("hnswlib ef=128",          lambda: run_hnswlib(db, queries, args.k, 128)),
+        ("LC, 1T",                       lambda: run_listofclusters(db, queries, args.k, nthreads=1)),
+        ("LC, HW threads",               lambda: run_listofclusters(db, queries, args.k, nthreads=0)),
+        ("faiss.FlatIP 1T",              lambda: run_faiss_flatip(db, queries, args.k, threads=1)),
+        ("faiss.FlatIP HW",              lambda: run_faiss_flatip(db, queries, args.k, threads=0)),
+        ("faiss.IVFFlat np=10 1T",       lambda: run_faiss_ivf(db, queries, args.k, 10, threads=1)),
+        ("faiss.IVFFlat np=10 HW",       lambda: run_faiss_ivf(db, queries, args.k, 10, threads=0)),
+        ("faiss.IVFFlat np=32 1T",       lambda: run_faiss_ivf(db, queries, args.k, 32, threads=1)),
+        ("faiss.IVFFlat np=32 HW",       lambda: run_faiss_ivf(db, queries, args.k, 32, threads=0)),
+        ("hnswlib ef=64 1T",             lambda: run_hnswlib(db, queries, args.k, 64, threads=1)),
+        ("hnswlib ef=64 HW",             lambda: run_hnswlib(db, queries, args.k, 64, threads=0)),
+        ("hnswlib ef=128 1T",            lambda: run_hnswlib(db, queries, args.k, 128, threads=1)),
+        ("hnswlib ef=128 HW",            lambda: run_hnswlib(db, queries, args.k, 128, threads=0)),
     ]
     print(f"\n{'method':<30s}  {'recall@k':>9s}  {'qps':>10s}  {'sec':>8s}")
     for name, fn in methods:
