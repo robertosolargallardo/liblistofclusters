@@ -361,6 +361,31 @@ template <class Metric, class Object>
 // Reference: this is the inner loop of Faiss's IndexFlatL2 (Johnson,
 // Douze, Jegou 2017).
 #if defined(LISTOFCLUSTERS_USE_BLAS)
+
+// Inner-product only path. Returns the Q×N matrix of q·p (no norm
+// decomposition, no sqrt). For unit-normalized vectors the IP ranking
+// is monotone w.r.t. L2 distance: argmax IP = argmin L2. Lets callers
+// (a) rank top-k by IP descending, then (b) compute the actual L2
+// distance ONLY for the k winners — avoiding the per-(q,p) sqrt and
+// norm-arithmetic work over the full Q×N matrix.
+[[nodiscard]] inline std::vector<float> batched_pairwise_ip_blas(
+    std::span<const float>  queries_f32,
+    std::span<const float>  points_f32,
+    std::size_t dim,
+    std::size_t n_queries,
+    std::size_t n_points)
+{
+    std::vector<float> ip(n_queries * n_points);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                static_cast<int>(n_queries), static_cast<int>(n_points), static_cast<int>(dim),
+                1.0f,
+                queries_f32.data(), static_cast<int>(dim),
+                points_f32.data(),  static_cast<int>(dim),
+                0.0f,
+                ip.data(),          static_cast<int>(n_points));
+    return ip;
+}
+
 [[nodiscard]] inline std::vector<double> batched_pairwise_distance_euclidean_blas(
     std::span<const float>  queries_f32,
     std::span<const float>  points_f32,

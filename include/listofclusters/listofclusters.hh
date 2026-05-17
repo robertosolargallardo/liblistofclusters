@@ -973,18 +973,24 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
         // than our NEON kernel on M1 (uses the AMX coprocessor).
         // BLAS does its own internal threading, so we skip the manual
         // nthreads partition for this path.
+        //
+        // At high D the topk path below recomputes via IP-only sgemm
+        // (skipping the per-element sqrt + norm-decomp). Skip this full
+        // distance build to avoid double-computing the same sgemm.
         if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
-            std::vector<float> q_f32(Q * D);
-            for (std::size_t i = 0; i < Q; ++i) {
-                const auto &qv = queries[i];
-                for (std::size_t j = 0; j < D; ++j)
-                    q_f32[i * D + j] = static_cast<float>(qv[j]);
+            if (D < 128) {
+                std::vector<float> q_f32(Q * D);
+                for (std::size_t i = 0; i < Q; ++i) {
+                    const auto &qv = queries[i];
+                    for (std::size_t j = 0; j < D; ++j)
+                        q_f32[i * D + j] = static_cast<float>(qv[j]);
+                }
+                d_qn = detail::batched_pairwise_distance_euclidean_blas(
+                    std::span<const float>(q_f32.data(), q_f32.size()),
+                    std::span<const float>(this->_centers.data_f32.data(), this->_centers.data_f32.size()),
+                    std::span<const float>(this->_centers.sq_norms_f32.data(), this->_centers.sq_norms_f32.size()),
+                    D, Q, N);
             }
-            d_qn = detail::batched_pairwise_distance_euclidean_blas(
-                std::span<const float>(q_f32.data(), q_f32.size()),
-                std::span<const float>(this->_centers.data_f32.data(), this->_centers.data_f32.size()),
-                std::span<const float>(this->_centers.sq_norms_f32.data(), this->_centers.sq_norms_f32.size()),
-                D, Q, N);
         } else
 #endif
         {
@@ -1048,7 +1054,7 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
         std::vector<float> d_qc;     // (Q, n_clusters) projected centroid distances
         std::vector<float> d_qa;     // (Q, K) projected anchor distances
         std::size_t K_anchors = 0;
-        const bool will_topk_path = (D >= 128);
+        [[maybe_unused]] const bool will_topk_path = (D >= 128);
 #if defined(LISTOFCLUSTERS_USE_BLAS)
         if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
             if (this->_centers.proj_enabled && this->_centers.n_anchors > 0 && !will_topk_path) {
@@ -1127,42 +1133,71 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
         }
 #endif
 
-        // At high D (curse-of-dimensionality), the LC walk's triangle filter
-        // prunes nothing — we measured the walk at ~3 ns × N_clusters ×
-        // bucket_size per query ≈ 30 µs/query × Q, equal to the BLAS sgemm
-        // itself. Since the full Q×N distance matrix is already in d_qn,
-        // bypass the LC walk and extract top-k directly via partial_sort.
-        // We pay one comparison per (q, point) but skip all per-cluster
-        // overhead. Stays exact: walk is replaced by an equivalent brute-
-        // force top-k over the same precomputed distances.
+        // At high D, the LC walk's TI filter prunes nothing and the L2
+        // norm-decomposition + per-element sqrt over the full Q×N matrix
+        // is wasted work. Instead:
+        //   1. Compute the Q×N INNER PRODUCT matrix via sgemm (half the
+        //      memory of d_qn, no decomposition or sqrt).
+        //   2. Rank top-k by IP descending (= L2 distance ascending for
+        //      vectors with bounded norms — exact iff ||q||² and ||p||²
+        //      are constant; for general vectors we need both terms).
+        //   3. For the top-k WINNERS (≤k per query), compute the actual
+        //      L2 distance via NEON. Cheap: k=10 elements per query.
         //
-        // Triggered for high-D workloads only — at low D, the LC walk's
-        // pruning is real and we keep the per-cluster path below.
+        // For general (non-normalized) vectors we use d²=||q||²-2·IP+||p||²
+        // for ranking too, since d² ranking = d ranking — but skip sqrt.
+        // Saves the ~1 ms per-element sqrt + double-precision write that
+        // dominated the post-sgemm step.
         if (D >= 128) {
+#if defined(LISTOFCLUSTERS_USE_BLAS)
+            // Recompute via IP-only sgemm (much cheaper output materialize).
+            std::vector<float> q_f32_topk(Q * D);
+            for (std::size_t i = 0; i < Q; ++i) {
+                const auto &qv = queries[i];
+                for (std::size_t j = 0; j < D; ++j)
+                    q_f32_topk[i * D + j] = static_cast<float>(qv[j]);
+            }
+            std::vector<float> q_sq(Q, 0.0f);
+            for (std::size_t i = 0; i < Q; ++i) {
+                float s = 0.0f;
+                for (std::size_t j = 0; j < D; ++j) {
+                    const float v = q_f32_topk[i * D + j]; s += v * v;
+                }
+                q_sq[i] = s;
+            }
+            std::vector<float> ip_qn = detail::batched_pairwise_ip_blas(
+                std::span<const float>(q_f32_topk.data(), q_f32_topk.size()),
+                std::span<const float>(this->_centers.data_f32.data(), this->_centers.data_f32.size()),
+                D, Q, N);
+
+            d_qn.clear();
+            d_qn.shrink_to_fit();   // release the now-unused L2 matrix
+
+            const float *p_sq = this->_centers.sq_norms_f32.data();
             auto topk_one = [&](std::size_t i) {
                 const std::uint32_t qid = start_qid + static_cast<std::uint32_t>(i);
                 auto &res = results[i];
                 res = resultslist_t(internal_object_t(queries[i], qid), k);
-                const double *d_row = d_qn.data() + i * N;
-                // Heap of (distance, row_idx). Use std::partial_sort_copy on
-                // pairs into a fixed top-k buffer.
-                std::vector<std::pair<double, std::uint32_t>> topk;
+                const float *ip_row = ip_qn.data() + i * N;
+                const float qsq_i = q_sq[i];
+                // Top-k by SQUARED distance ascending. d²[r] = q_sq - 2*ip + p_sq[r].
+                std::vector<std::pair<float, std::uint32_t>> topk;
                 topk.reserve(k + 1);
                 for (std::uint32_t r = 0; r < N; ++r) {
-                    const double d = d_row[r];
+                    float d2 = qsq_i - 2.0f * ip_row[r] + p_sq[r];
+                    if (d2 < 0.0f) d2 = 0.0f;
                     if (topk.size() < k) {
-                        topk.emplace_back(d, r);
+                        topk.emplace_back(d2, r);
                         std::push_heap(topk.begin(), topk.end());
-                    } else if (d < topk.front().first) {
+                    } else if (d2 < topk.front().first) {
                         std::pop_heap(topk.begin(), topk.end());
-                        topk.back() = {d, r};
+                        topk.back() = {d2, r};
                         std::push_heap(topk.begin(), topk.end());
                     }
                 }
                 std::sort_heap(topk.begin(), topk.end());
-                // Translate row → (cluster_idx, bucket_idx) and push to res.
-                for (const auto &[d, r] : topk) {
-                    // Find the owning cluster via binary search in cluster_centroid_row.
+                for (const auto &[d2, r] : topk) {
+                    const double d = std::sqrt(static_cast<double>(d2));
                     const auto &rows = this->_centers.cluster_centroid_row;
                     auto it = std::upper_bound(rows.begin(), rows.end(), r);
                     const std::size_t ci = static_cast<std::size_t>(it - rows.begin() - 1);
@@ -1179,6 +1214,46 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
                     }
                 }
             };
+#else
+            // Non-BLAS fallback: d_qn was filled by the NEON/AVX2 path.
+            // Heap top-k over the precomputed distance matrix.
+            auto topk_one = [&](std::size_t i) {
+                const std::uint32_t qid = start_qid + static_cast<std::uint32_t>(i);
+                auto &res = results[i];
+                res = resultslist_t(internal_object_t(queries[i], qid), k);
+                const double *d_row = d_qn.data() + i * N;
+                std::vector<std::pair<double, std::uint32_t>> topk;
+                topk.reserve(k + 1);
+                for (std::uint32_t r = 0; r < N; ++r) {
+                    const double d = d_row[r];
+                    if (topk.size() < k) {
+                        topk.emplace_back(d, r);
+                        std::push_heap(topk.begin(), topk.end());
+                    } else if (d < topk.front().first) {
+                        std::pop_heap(topk.begin(), topk.end());
+                        topk.back() = {d, r};
+                        std::push_heap(topk.begin(), topk.end());
+                    }
+                }
+                std::sort_heap(topk.begin(), topk.end());
+                for (const auto &[d, r] : topk) {
+                    const auto &rows = this->_centers.cluster_centroid_row;
+                    auto it = std::upper_bound(rows.begin(), rows.end(), r);
+                    const std::size_t ci = static_cast<std::size_t>(it - rows.begin() - 1);
+                    const std::uint32_t base = rows[ci];
+                    if (r == base) {
+                        const auto &cc = this->_list[ci].centroid();
+                        if (!cc.ghost() && cc.id() != qid)
+                            res.push(cc.object(), cc.id(), d);
+                    } else {
+                        const std::size_t bi = r - base - 1;
+                        const auto &m = this->_list[ci].bucket()[bi];
+                        if (m.id() != qid)
+                            res.push(m.object(), m.id(), d);
+                    }
+                }
+            };
+#endif
             if (nthreads <= 1) {
                 for (std::size_t i = 0; i < Q; ++i) topk_one(i);
             } else {
