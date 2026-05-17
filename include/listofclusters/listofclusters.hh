@@ -90,29 +90,6 @@ public:
         std::size_t                proj_dim   = 0;
         bool                       proj_enabled = false;
 
-        // -------------------------------------------------------------
-        // AESA-on-PCA hierarchical filter at the CLUSTER level.
-        //
-        // Picks K=AESA_ANCHORS anchors via FFT in the projected (D'-dim)
-        // space. For each cluster centroid, precompute d_proj distance
-        // to each anchor: N_clusters × K floats.
-        //
-        // At query time, compute d_proj(q, a_j) (K sgemv values) and
-        // derive a per-cluster LB:
-        //     LB_AESA(q, c) = max_j |d_proj(q, a_j) - d_proj(c, a_j)|
-        //
-        // Combine with the pure-PCA bound:
-        //     LB_combined(q, c) = max(LB_PCA, LB_AESA)
-        //
-        // Both are deterministic LBs on d_full(q, c). Composing by max
-        // gives a strictly tighter LB. Whole clusters are skipped when
-        // LB_combined > current radius — saving the per-cluster bucket
-        // walk entirely.
-        // -------------------------------------------------------------
-        std::vector<float>         anchors_proj_f32;     // (K, D') anchor positions in projected space
-        std::vector<float>         centroid_to_anchor_f32; // (N_clusters, K) cluster centroid → each anchor
-        std::size_t                n_anchors  = 0;
-
         std::size_t                dim   = 0;
         std::size_t                n     = 0;        // total point count (rows)
         std::size_t                n_clusters = 0;
@@ -123,11 +100,6 @@ public:
     // embedding spectra (Jina v2, BGE, etc.); captures ~80% of variance
     // for D≥256 dense embeddings. Tunable via this compile-time constant.
     static constexpr std::size_t PROJ_DIM = 64;
-
-    // Number of anchors for the AESA-on-PCA cluster-level filter.
-    // 8 is the sweet spot: enough for tight bounds, cheap per-query
-    // overhead (8 sgemv values + 8 max-reduce ops per cluster).
-    static constexpr std::size_t AESA_ANCHORS = 8;
 
 private:
     template <class O, class M, std::size_t B, std::size_t V> friend class lc_test_access;
@@ -604,93 +576,8 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
                 this->_centers.dim, this->_centers.n);
         }
 
-        // AESA-on-PCA per-query cluster LB pre-compute (online path).
-        std::vector<float> d_qc_arr;       // n_clusters
-        std::vector<float> d_qa_arr;       // K
-        std::size_t K_anchors_online = 0;
-#if defined(LISTOFCLUSTERS_USE_BLAS)
-        if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
-            if (this->_centers.proj_enabled && this->_centers.n_anchors > 0) {
-                K_anchors_online = this->_centers.n_anchors;
-                const std::size_t Dp = this->_centers.proj_dim;
-                const std::size_t Dd = this->_centers.dim;
-                // 1. Center + project query.
-                std::vector<float> qc(Dd);
-                for (std::size_t j = 0; j < Dd; ++j)
-                    qc[j] = static_cast<float>(q[j]) - this->_centers.mean_f32[j];
-                std::vector<float> qp(Dp);
-                cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                            static_cast<int>(Dp), static_cast<int>(Dd),
-                            1.0f, this->_centers.proj_matrix_f32.data(), static_cast<int>(Dd),
-                            qc.data(), 1,
-                            0.0f, qp.data(), 1);
-                float qp_sq = 0.0f;
-                for (std::size_t j = 0; j < Dp; ++j) qp_sq += qp[j] * qp[j];
-                // 2. d_proj(q, centroid_i) for all i, via sgemv against centroid-only proj matrix.
-                const std::size_t nc = this->_list.size();
-                std::vector<float> c_proj_packed(nc * Dp);
-                std::vector<float> c_proj_sq(nc, 0.0f);
-                for (std::size_t ci = 0; ci < nc; ++ci) {
-                    const std::size_t crow = this->_centers.cluster_centroid_row[ci];
-                    const float *src = this->_centers.data_proj_f32.data() + crow * Dp;
-                    std::memcpy(c_proj_packed.data() + ci * Dp, src, Dp * sizeof(float));
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < Dp; ++j) s += src[j] * src[j];
-                    c_proj_sq[ci] = s;
-                }
-                std::vector<float> ip_qc_v(nc);
-                cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                            static_cast<int>(nc), static_cast<int>(Dp),
-                            1.0f, c_proj_packed.data(), static_cast<int>(Dp),
-                            qp.data(), 1,
-                            0.0f, ip_qc_v.data(), 1);
-                d_qc_arr.assign(nc, 0.0f);
-                for (std::size_t ci = 0; ci < nc; ++ci) {
-                    float d2 = qp_sq - 2.0f * ip_qc_v[ci] + c_proj_sq[ci];
-                    if (d2 < 0.0f) d2 = 0.0f;
-                    d_qc_arr[ci] = std::sqrt(d2);
-                }
-                // 3. d_proj(q, anchor_k) for K anchors.
-                std::vector<float> a_proj_sq(K_anchors_online, 0.0f);
-                for (std::size_t kk = 0; kk < K_anchors_online; ++kk) {
-                    const float *ap = this->_centers.anchors_proj_f32.data() + kk * Dp;
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < Dp; ++j) s += ap[j] * ap[j];
-                    a_proj_sq[kk] = s;
-                }
-                std::vector<float> ip_qa_v(K_anchors_online);
-                cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                            static_cast<int>(K_anchors_online), static_cast<int>(Dp),
-                            1.0f, this->_centers.anchors_proj_f32.data(), static_cast<int>(Dp),
-                            qp.data(), 1,
-                            0.0f, ip_qa_v.data(), 1);
-                d_qa_arr.assign(K_anchors_online, 0.0f);
-                for (std::size_t kk = 0; kk < K_anchors_online; ++kk) {
-                    float d2 = qp_sq - 2.0f * ip_qa_v[kk] + a_proj_sq[kk];
-                    if (d2 < 0.0f) d2 = 0.0f;
-                    d_qa_arr[kk] = std::sqrt(d2);
-                }
-            }
-        }
-#endif
-
         const std::size_t n_clusters = this->_list.size();
-        const float *c2a_online = this->_centers.centroid_to_anchor_f32.data();
         for (std::size_t i = 0; i < n_clusters; ++i) {
-            // AESA-on-PCA combined LB skip.
-            if (!d_qc_arr.empty()) {
-                const float lb_pca = d_qc_arr[i];
-                float lb_aesa = 0.0f;
-                const float *c2a_row = c2a_online + i * K_anchors_online;
-                for (std::size_t kk = 0; kk < K_anchors_online; ++kk) {
-                    const float diff = std::abs(d_qa_arr[kk] - c2a_row[kk]);
-                    if (diff > lb_aesa) lb_aesa = diff;
-                }
-                const float lb = (lb_pca > lb_aesa) ? lb_pca : lb_aesa;
-                const float skip_thresh = static_cast<float>(radius + this->_list[i].radius());
-                if (lb > skip_thresh) continue;
-            }
-
             const auto &c = this->_list[i];
             const std::size_t base = this->_centers.cluster_centroid_row[i];
             const double d = d_all[base];
@@ -1402,101 +1289,6 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::refresh_centers_s
             _centers.mean_f32 = std::move(mean);
             _centers.proj_dim = D_proj;
             _centers.proj_enabled = true;
-
-            // 8. AESA anchors in projected space, via Farthest-First Traversal
-            //    [Gonzalez 1985]. Uses cluster centroids as candidate pool —
-            //    they're a balanced sample of the data manifold.
-            const std::size_t K = AESA_ANCHORS;
-            if (n_clusters >= K) {
-                std::vector<std::uint32_t> centroid_rows;
-                centroid_rows.reserve(n_clusters);
-                for (std::size_t ci = 0; ci < n_clusters; ++ci)
-                    centroid_rows.push_back(_centers.cluster_centroid_row[ci]);
-
-                std::vector<std::uint32_t> anchor_centroid_idx;
-                anchor_centroid_idx.reserve(K);
-                std::mt19937 rng(0xA1A1A1A1u);
-                anchor_centroid_idx.push_back(rng() % n_clusters);
-
-                std::vector<float> min_d_to_anchor(n_clusters, std::numeric_limits<float>::infinity());
-                auto update_mins = [&](std::uint32_t new_anchor_ci) {
-                    const float *ap = _centers.data_proj_f32.data()
-                                    + centroid_rows[new_anchor_ci] * D_proj;
-                    for (std::size_t ci = 0; ci < n_clusters; ++ci) {
-                        const float *cp = _centers.data_proj_f32.data()
-                                        + centroid_rows[ci] * D_proj;
-                        float s = 0.0f;
-                        for (std::size_t j = 0; j < D_proj; ++j) {
-                            const float diff = ap[j] - cp[j];
-                            s += diff * diff;
-                        }
-                        const float d = std::sqrt(s);
-                        if (d < min_d_to_anchor[ci]) min_d_to_anchor[ci] = d;
-                    }
-                };
-                update_mins(anchor_centroid_idx.front());
-
-                while (anchor_centroid_idx.size() < K) {
-                    std::size_t best = 0;
-                    float best_d = -1.0f;
-                    for (std::size_t ci = 0; ci < n_clusters; ++ci)
-                        if (min_d_to_anchor[ci] > best_d) {
-                            best_d = min_d_to_anchor[ci];
-                            best = ci;
-                        }
-                    anchor_centroid_idx.push_back(static_cast<std::uint32_t>(best));
-                    update_mins(static_cast<std::uint32_t>(best));
-                }
-
-                // Pack anchor projected positions into contiguous (K, D').
-                _centers.anchors_proj_f32.assign(K * D_proj, 0.0f);
-                for (std::size_t i = 0; i < K; ++i) {
-                    const std::uint32_t ci = anchor_centroid_idx[i];
-                    const float *src = _centers.data_proj_f32.data()
-                                     + centroid_rows[ci] * D_proj;
-                    std::memcpy(_centers.anchors_proj_f32.data() + i * D_proj,
-                                src, D_proj * sizeof(float));
-                }
-
-                // Centroid-to-anchor distance matrix: (N_clusters, K).
-                // Computed via one cblas_sgemm-derived IP + sq-norm
-                // decomposition, then sqrt.
-                _centers.centroid_to_anchor_f32.assign(n_clusters * K, 0.0f);
-                // Gather centroid projected vectors into contiguous matrix.
-                std::vector<float> centroids_proj(n_clusters * D_proj);
-                std::vector<float> centroid_proj_sq(n_clusters, 0.0f);
-                for (std::size_t ci = 0; ci < n_clusters; ++ci) {
-                    const float *src = _centers.data_proj_f32.data()
-                                     + centroid_rows[ci] * D_proj;
-                    std::memcpy(centroids_proj.data() + ci * D_proj,
-                                src, D_proj * sizeof(float));
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < D_proj; ++j) s += src[j] * src[j];
-                    centroid_proj_sq[ci] = s;
-                }
-                // Anchor sq norms.
-                std::vector<float> anchor_proj_sq(K, 0.0f);
-                for (std::size_t i = 0; i < K; ++i) {
-                    const float *ap = _centers.anchors_proj_f32.data() + i * D_proj;
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < D_proj; ++j) s += ap[j] * ap[j];
-                    anchor_proj_sq[i] = s;
-                }
-                // IP = centroids_proj @ anchors_proj^T  (N_clusters × K).
-                std::vector<float> ip(n_clusters * K);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            static_cast<int>(n_clusters), static_cast<int>(K), static_cast<int>(D_proj),
-                            1.0f, centroids_proj.data(), static_cast<int>(D_proj),
-                            _centers.anchors_proj_f32.data(), static_cast<int>(D_proj),
-                            0.0f, ip.data(), static_cast<int>(K));
-                for (std::size_t ci = 0; ci < n_clusters; ++ci)
-                    for (std::size_t i = 0; i < K; ++i) {
-                        float d2 = centroid_proj_sq[ci] - 2.0f * ip[ci * K + i] + anchor_proj_sq[i];
-                        if (d2 < 0.0f) d2 = 0.0f;
-                        _centers.centroid_to_anchor_f32[ci * K + i] = std::sqrt(d2);
-                    }
-                _centers.n_anchors = K;
-            }
         }
     }
 #endif
