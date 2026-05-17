@@ -25,4 +25,19 @@ nanobind_add_module(_listofclusters
 target_include_directories(_listofclusters PRIVATE "${LIB_INCLUDE}")
 target_compile_options(_listofclusters PRIVATE -O3)
 
+# Optional BLAS fast path: on Apple link Accelerate framework (cblas_sgemm
+# for the batched pairwise distance hot path in detail/batched_distance.hh).
+# On other platforms try to find a BLAS library; if none, the NEON/AVX2
+# fallback in the same header is still used.
+if(APPLE)
+  target_link_libraries(_listofclusters PRIVATE "-framework Accelerate")
+  target_compile_definitions(_listofclusters PRIVATE LISTOFCLUSTERS_USE_BLAS=1)
+else()
+  find_package(BLAS QUIET)
+  if(BLAS_FOUND)
+    target_link_libraries(_listofclusters PRIVATE ${BLAS_LIBRARIES})
+    target_compile_definitions(_listofclusters PRIVATE LISTOFCLUSTERS_USE_BLAS=1)
+  endif()
+endif()
+
 install(TARGETS _listofclusters LIBRARY DESTINATION listofclusters)

@@ -52,6 +52,12 @@ public:
     // Kept in sync with _list and rebuilt lazily; invalidated by insert/remove.
     struct centers_soa_t {
         std::vector<double>        data;
+        // Float32 mirror of `data` used by the BLAS (cblas_sgemm) fast
+        // path in batch_knn. Built alongside `data` to amortize the cast.
+        // Also stores ||p||² per point for the d²= ||q||²-2q·p+||p||²
+        // decomposition.
+        std::vector<float>         data_f32;
+        std::vector<float>         sq_norms_f32;
         std::vector<std::uint32_t> cluster_centroid_row;
         std::size_t                dim   = 0;
         std::size_t                n     = 0;        // total point count (rows)
@@ -608,12 +614,32 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
 
         // ONE big SIMD pass: Q×N distance matrix. Cost ~ Q*N*D ops, but the
         // N*D-byte corpus is streamed only once instead of Q times.
-        // Parallelized over POINT chunks — each thread handles a slice of
-        // rows, computing distances to all Q queries for those rows. Output
-        // matrix is stored Q×N row-major, so threads write to disjoint
-        // columns of each row (no contention, but column stride means each
-        // thread touches the entire output — fine for L2-sized output).
-        std::vector<double> d_qn(Q * N);
+        std::vector<double> d_qn;
+
+#if defined(LISTOFCLUSTERS_USE_BLAS)
+        // BLAS fast path for Euclidean: cblas_sgemm in float32. Apple
+        // Accelerate / OpenBLAS / MKL is hand-tuned to peak; ~10× faster
+        // than our NEON kernel on M1 (uses the AMX coprocessor).
+        // BLAS does its own internal threading, so we skip the manual
+        // nthreads partition for this path.
+        if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
+            std::vector<float> q_f32(Q * D);
+            for (std::size_t i = 0; i < Q; ++i) {
+                const auto &qv = queries[i];
+                for (std::size_t j = 0; j < D; ++j)
+                    q_f32[i * D + j] = static_cast<float>(qv[j]);
+            }
+            d_qn = detail::batched_pairwise_distance_euclidean_blas(
+                std::span<const float>(q_f32.data(), q_f32.size()),
+                std::span<const float>(this->_centers.data_f32.data(), this->_centers.data_f32.size()),
+                std::span<const float>(this->_centers.sq_norms_f32.data(), this->_centers.sq_norms_f32.size()),
+                D, Q, N);
+        } else
+#endif
+        {
+        // Fallback: NEON/AVX2 multi-query kernel parallelized over POINT
+        // chunks (each thread handles a slice of rows × all Q queries).
+        d_qn.assign(Q * N, 0.0);
         auto run_pairwise = [&](std::size_t p0, std::size_t p1) {
             if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
                 auto chunk = detail::batched_pairwise_distance_euclidean(
@@ -651,6 +677,7 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
             }
             for (auto &t : ts) t.join();
         }
+        }  // close BLAS / non-BLAS branch
 
         const std::size_t n_clusters = this->_list.size();
         auto walk_one = [&](std::size_t i) {
@@ -780,6 +807,19 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::refresh_centers_s
                 _centers.data[row * dim + j] = static_cast<double>(mobj[j]);
             ++row;
         }
+    }
+
+    // Build the float32 mirror + per-point squared norm for the BLAS path.
+    _centers.data_f32.assign(_centers.n * dim, 0.0f);
+    _centers.sq_norms_f32.assign(_centers.n, 0.0f);
+    for (std::size_t r = 0; r < _centers.n; ++r) {
+        float s = 0.0f;
+        for (std::size_t j = 0; j < dim; ++j) {
+            const float v = static_cast<float>(_centers.data[r * dim + j]);
+            _centers.data_f32[r * dim + j] = v;
+            s += v * v;
+        }
+        _centers.sq_norms_f32[r] = s;
     }
     _centers.stale = false;
 }

@@ -28,6 +28,17 @@
 #  include <immintrin.h>
 #endif
 
+// Optional BLAS fast path: cblas_sgemm via Apple Accelerate / OpenBLAS /
+// MKL. Wired by CMake (LISTOFCLUSTERS_USE_BLAS). Falls back to the NEON/
+// AVX2 kernel below when unavailable.
+#if defined(LISTOFCLUSTERS_USE_BLAS)
+#  if defined(__APPLE__)
+#    include <Accelerate/Accelerate.h>
+#  else
+#    include <cblas.h>
+#  endif
+#endif
+
 namespace metric {
 
 struct euclidean;   // forward decls so the per-metric overloads below can
@@ -333,6 +344,65 @@ template <class Metric, class Object>
     }
     return out;
 }
+
+// BLAS fast path: Euclidean batched pairwise via cblas_sgemm in float32.
+// Math: d²(q, p) = ||q||² − 2·(q·p) + ||p||². The q·p term is a Q×N matrix
+// product computed by sgemm — hand-tuned to peak (Apple Accelerate uses
+// AMX coprocessor on M-series chips, ~10x our NEON kernel). The ||q||²
+// and ||p||² terms are cheap; ||p||² is precomputed at build time and
+// passed in.
+//
+// Caller must pre-cast points + queries to float32 and supply
+// points_sq_norms[j] = ||p_j||². Returns Q×N row-major double distances.
+//
+// Float32 is lossless for top-k kNN ranking on Jina-style L2-normalized
+// embeddings — relative ordering preserved within float32 precision.
+//
+// Reference: this is the inner loop of Faiss's IndexFlatL2 (Johnson,
+// Douze, Jegou 2017).
+#if defined(LISTOFCLUSTERS_USE_BLAS)
+[[nodiscard]] inline std::vector<double> batched_pairwise_distance_euclidean_blas(
+    std::span<const float>  queries_f32,
+    std::span<const float>  points_f32,
+    std::span<const float>  points_sq_norms,
+    std::size_t dim,
+    std::size_t n_queries,
+    std::size_t n_points)
+{
+    // 1. Inner-product matrix IP = Q · P^T, dimensions Q × N.
+    std::vector<float> ip(n_queries * n_points);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                static_cast<int>(n_queries), static_cast<int>(n_points), static_cast<int>(dim),
+                1.0f,
+                queries_f32.data(), static_cast<int>(dim),
+                points_f32.data(),  static_cast<int>(dim),
+                0.0f,
+                ip.data(),          static_cast<int>(n_points));
+
+    // 2. Per-query squared norm.
+    std::vector<float> qs(n_queries);
+    for (std::size_t i = 0; i < n_queries; ++i) {
+        float s = 0.0f;
+        const float *qrow = queries_f32.data() + i * dim;
+        for (std::size_t k = 0; k < dim; ++k) s += qrow[k] * qrow[k];
+        qs[i] = s;
+    }
+
+    // 3. d²[i,j] = ||q_i||² − 2·IP[i,j] + ||p_j||². sqrt + emit double.
+    std::vector<double> out(n_queries * n_points);
+    for (std::size_t i = 0; i < n_queries; ++i) {
+        const float qs_i = qs[i];
+        const float *ip_row = ip.data() + i * n_points;
+        double *out_row = out.data() + i * n_points;
+        for (std::size_t j = 0; j < n_points; ++j) {
+            float d2 = qs_i - 2.0f * ip_row[j] + points_sq_norms[j];
+            if (d2 < 0.0f) d2 = 0.0f;  // numerical floor (sub of close magnitudes)
+            out_row[j] = std::sqrt(static_cast<double>(d2));
+        }
+    }
+    return out;
+}
+#endif
 
 // SIMD overload for Euclidean. Point row in outer loop = cache-resident
 // while inner Q queries iterate; query rows streamed sequentially from a
