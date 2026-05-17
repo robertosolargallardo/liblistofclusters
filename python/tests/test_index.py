@@ -115,15 +115,14 @@ def test_remove():
         assert i not in nbrs
 
 
-def test_build_aesa_preserves_recall():
+def test_freeze_amortizes_first_query():
     rng = np.random.default_rng(11)
     db = rng.uniform(-1.0, 1.0, size=(200, 4))
     ids = np.arange(len(db), dtype=np.uint32)
 
     idx = Index(metric="euclidean")
     idx.bulk_build(db, ids)
-    idx.build_aesa(8)
-    idx.freeze()
+    idx.freeze()  # idempotent — bulk_build already refreshed
 
     for _ in range(5):
         q = rng.uniform(-1.0, 1.0, size=4)
@@ -131,16 +130,7 @@ def test_build_aesa_preserves_recall():
         bf = np.linalg.norm(db - q, axis=1)
         expected = np.argsort(bf)[:5]
         for e in expected:
-            assert e in set(nbrs), f"AESA-on knn missed expected NN {e}"
-
-
-def test_build_aesa_zero_disables():
-    idx = Index(metric="euclidean")
-    idx.insert(np.array([0.0, 1.0]), np.uint32(0))
-    idx.insert(np.array([1.0, 0.0]), np.uint32(1))
-    idx.build_aesa(0)  # no-op
-    nbrs, _ = idx.knn(np.array([0.5, 0.5]), k=2)
-    assert set(nbrs) == {0, 1}
+            assert e in set(nbrs), f"frozen-index knn missed expected NN {e}"
 
 
 def test_each_supported_metric_constructible():

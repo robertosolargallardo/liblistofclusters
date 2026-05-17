@@ -54,7 +54,6 @@ public:
     virtual void batch_insert(const std::vector<vec_t>&, const std::vector<std::uint32_t>&) = 0;
     virtual void batch_remove(const std::vector<vec_t>&, const std::vector<std::uint32_t>&) = 0;
     virtual void bulk_build(const std::vector<vec_t>&, const std::vector<std::uint32_t>&) = 0;
-    virtual void build_aesa(std::size_t k_anchors) = 0;
     virtual void freeze() = 0;
     virtual std::pair<std::vector<std::uint32_t>, std::vector<double>>
         knn(const vec_t&, std::size_t k) = 0;
@@ -98,7 +97,6 @@ public:
     void bulk_build(const std::vector<vec_t>& objs, const std::vector<std::uint32_t>& ids) override {
         _idx.bulk_build(objs, ids);
     }
-    void build_aesa(std::size_t k_anchors) override { _idx.build_aesa(k_anchors); }
     void freeze() override { _idx.freeze(); }
 
     std::pair<std::vector<std::uint32_t>, std::vector<double>>
@@ -274,17 +272,11 @@ NB_MODULE(_listofclusters, m)
             nb::arg("V"), nb::arg("ids"),
             "Canonical LC construction. Replaces any existing index state.")
 
-        .def("build_aesa",
-            &IndexBase::build_aesa,
-            nb::arg("k_anchors"),
-            "Build the AESA-lite k-anchor pivot table for triangle-inequality "
-            "filtering of bucket candidates. k_anchors=0 disables and frees "
-            "the table.")
-
         .def("freeze",
             &IndexBase::freeze,
-            "Eagerly build / refresh all side structures "
-            "(centers SoA, AESA-lite if enabled). Amortizes first-query cost.")
+            "Eagerly build / refresh all side structures (centers SoA). "
+            "Amortizes first-query cost for purely-online callers that "
+            "never call bulk_build.")
 
         // kNN, single query. Returns (ids, dists) tuple.
         .def("knn",

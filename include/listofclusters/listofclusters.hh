@@ -5,7 +5,6 @@
 #include <listofclusters/resultslist.hh>
 #include <listofclusters/internal_object.hh>
 #include <listofclusters/detail/batched_distance.hh>
-#include <listofclusters/detail/aesa.hh>
 #include <numeric>
 #include <span>
 
@@ -49,8 +48,6 @@ public:
         bool                stale = true;
     };
 
-    using aesa_table_t = detail::aesa_table_t<object_t>;
-
 private:
     template <class O, class M, std::size_t B, std::size_t V> friend class lc_test_access;
 
@@ -58,7 +55,6 @@ private:
     uint32_t               _cid{0U};
     [[no_unique_address]] distance_t _metric{};
     mutable centers_soa_t  _centers;
-    mutable aesa_table_t   _aesa;
 
 public:
     listofclusters(void) = default;
@@ -126,11 +122,6 @@ public:
     // rebuild cost.
     void freeze();
 
-    // Build (or rebuild) an AESA-lite global anchor table with k_anchors
-    // anchors selected via Farthest-First Traversal [G85, BNC03]. Pass 0
-    // to disable / free. See detail/aesa.hh for the lower-bound derivation.
-    void build_aesa(std::size_t k_anchors);
-
     void centroids(std::ostream &os = std::cout) const
     {
         for(const auto& c : this->_list)
@@ -141,7 +132,6 @@ private:
     void range_search(resultslist_t&, const double&) const;
     void explore(resultslist_t&, const cluster_t&, const double&) const;
     void refresh_centers_soa_() const;
-    void refresh_aesa_() const;
 
     static_assert(overflow >= bucket_size,
                   "overflow must be >= bucket_size (legacy invariant)");
@@ -162,7 +152,6 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::insert(const object_t &_object, const uint32_t &_id)
 {
     this->_centers.stale = true;
-    this->_aesa.stale = true;
     object_t obj = _object;
     uint32_t id  = _id;
 
@@ -197,7 +186,6 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::remove(const object_t &_object, const uint32_t &_id)
 {
     this->_centers.stale = true;
-    this->_aesa.stale = true;
     for(auto it = this->_list.begin(); it != this->_list.end(); ++it)
         {
             const double d = this->_metric(_object, it->centroid().object());
@@ -218,7 +206,6 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::clear(void) noexc
     this->_list.clear();
     this->_cid = 0U;
     this->_centers = centers_soa_t{};
-    this->_aesa = aesa_table_t{};
 }
 
 // ---------------------------------------------------------------------------
@@ -388,43 +375,17 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
     const uint32_t qid = _results.centroid().id();
     if (this->_list.empty()) return;
 
-    std::vector<double> dqa;
-    if (this->_aesa.k_anchors > 0) {
-        if (this->_aesa.stale) this->refresh_aesa_();
-        dqa.resize(this->_aesa.k_anchors);
-        for (std::size_t i = 0; i < this->_aesa.k_anchors; ++i)
-            dqa[i] = this->_metric(q, this->_aesa.anchors[i].object());
-    }
-
-    const std::size_t k_anchors = this->_aesa.k_anchors;
-    const double *aesa_dists = k_anchors ? this->_aesa.dists.data() : nullptr;
-
-    auto process_cluster = [&](std::size_t ci, const cluster_t &c, double d) -> bool {
+    auto process_cluster = [&](const cluster_t &c, double d) -> bool {
         const internal_object_t &cc = c.centroid();
         if((d - _radius) <= c.radius()) {
             if(d <= _radius && !cc.ghost() && cc.id() != qid)
                 _results.push(cc.object(), cc.id(), d);
-            const std::size_t base = k_anchors
-                ? static_cast<std::size_t>(this->_aesa.cluster_centroid_row[ci])
-                : 0;
-            std::size_t bi = 0;
             for(const auto &o : c.bucket()) {
-                if((d - _radius) > o.distance() || (d + _radius) < o.distance()) {
-                    ++bi; continue;
-                }
-                if (k_anchors) {
-                    const double *row = aesa_dists + (base + 1 + bi) * k_anchors;
-                    double lb = 0.0;
-                    for (std::size_t i = 0; i < k_anchors; ++i) {
-                        const double diff = std::abs(dqa[i] - row[i]);
-                        if (diff > lb) lb = diff;
-                    }
-                    if (lb > _radius) { ++bi; continue; }
-                }
+                if((d - _radius) > o.distance() || (d + _radius) < o.distance())
+                    continue;
                 const double md = this->_metric(q, o.object());
                 if(md <= _radius && o.id() != qid)
                     _results.push(o.object(), o.id(), md);
-                ++bi;
             }
         }
         // LC build-order early-termination invariant (Chavez & Navarro 2005 §4).
@@ -438,16 +399,14 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
             std::span<const double>(this->_centers.data.data(), this->_centers.data.size()),
             this->_centers.dim, this->_centers.n);
         for (std::size_t i = 0; i < this->_centers.n; ++i) {
-            if (process_cluster(i, this->_list[i], d_centers[i])) return;
+            if (process_cluster(this->_list[i], d_centers[i])) return;
         }
         return;
     }
 
-    const std::size_t n = this->_list.size();
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto &c = this->_list[i];
+    for (const auto &c : this->_list) {
         const double d = this->_metric(q, c.centroid().object());
-        if (process_cluster(i, c, d)) return;
+        if (process_cluster(c, d)) return;
     }
 }
 
@@ -504,51 +463,22 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
             radius = std::prev(results.results().end())->distance();
     };
 
-    // Pre-compute d(q, anchor_i) once per query if AESA is enabled.
-    std::vector<double> dqa;
-    if (this->_aesa.k_anchors > 0) {
-        if (this->_aesa.stale) this->refresh_aesa_();
-        dqa.resize(this->_aesa.k_anchors);
-        for (std::size_t i = 0; i < this->_aesa.k_anchors; ++i)
-            dqa[i] = this->_metric(q, this->_aesa.anchors[i].object());
-    }
-
-    const std::size_t k_anchors = this->_aesa.k_anchors;
-    const double *aesa_dists = k_anchors ? this->_aesa.dists.data() : nullptr;
-
     // Per-cluster walk, sharing the precomputed d(q, centroid_i) passed in.
-    // ci is the cluster index, used to address into the AESA dists table
-    // via cluster_centroid_row[ci] — no hashmap lookup on the hot path.
-    auto process_cluster = [&](std::size_t ci, const cluster_t &c, double d) -> bool {
+    auto process_cluster = [&](const cluster_t &c, double d) -> bool {
         const internal_object_t &cc = c.centroid();
         if (d < radius && !cc.ghost() && cc.id() != qid) {
             results.push(cc.object(), cc.id(), d);
             refresh_radius();
         }
         if ((d - radius) <= c.radius()) {
-            const std::size_t base = k_anchors
-                ? static_cast<std::size_t>(this->_aesa.cluster_centroid_row[ci])
-                : 0;
-            std::size_t bi = 0;
             for (const auto &m : c.bucket()) {
-                if ((d - radius) > m.distance() || (d + radius) < m.distance()) {
-                    ++bi; continue;
-                }
-                if (k_anchors) {
-                    const double *row = aesa_dists + (base + 1 + bi) * k_anchors;
-                    double lb = 0.0;
-                    for (std::size_t i = 0; i < k_anchors; ++i) {
-                        const double diff = std::abs(dqa[i] - row[i]);
-                        if (diff > lb) lb = diff;
-                    }
-                    if (lb >= radius) { ++bi; continue; }
-                }
+                if ((d - radius) > m.distance() || (d + radius) < m.distance())
+                    continue;
                 const double md = this->_metric(q, m.object());
                 if (md < radius && m.id() != qid) {
                     results.push(m.object(), m.id(), md);
                     refresh_radius();
                 }
-                ++bi;
             }
         }
         return ((d + radius) <= c.radius());
@@ -569,17 +499,15 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
             this->_centers.dim, this->_centers.n);
 
         for (std::size_t i = 0; i < this->_centers.n; ++i) {
-            if (process_cluster(i, this->_list[i], d_centers[i])) break;
+            if (process_cluster(this->_list[i], d_centers[i])) break;
         }
         return results;
     } else {
         // Scalar fallback for non-batched metrics (Levenshtein, custom):
         // same shape, the metric functor is called per-cluster.
-        const std::size_t n = this->_list.size();
-        for (std::size_t i = 0; i < n; ++i) {
-            const auto &c = this->_list[i];
+        for (const auto &c : this->_list) {
             const double d = this->_metric(q, c.centroid().object());
-            if (process_cluster(i, c, d)) break;
+            if (process_cluster(c, d)) break;
         }
         return results;
     }
@@ -669,92 +597,6 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::freeze()
 {
     this->refresh_centers_soa_();
-    if (this->_aesa.k_anchors > 0)
-        this->refresh_aesa_();
-}
-
-// ---------------------------------------------------------------------------
-// build_aesa / refresh_aesa_ — global anchor table (Mico-Oncina-Vidal 1994
-// LAESA, with FFT anchor selection per Gonzalez 1985 + Bustos-Navarro-Chavez
-// 2003).
-// ---------------------------------------------------------------------------
-template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
-    requires Metric<distance_t, object_t>
-void listofclusters<object_t,distance_t,bucket_size,overflow>::build_aesa(std::size_t k_anchors)
-{
-    this->_aesa = aesa_table_t{};
-    this->_aesa.k_anchors = k_anchors;
-    if (k_anchors == 0 || this->_list.empty()) {
-        this->_aesa.stale = false;
-        return;
-    }
-    this->refresh_aesa_();
-}
-
-template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
-    requires Metric<distance_t, object_t>
-void listofclusters<object_t,distance_t,bucket_size,overflow>::refresh_aesa_() const
-{
-    if (this->_aesa.k_anchors == 0) {
-        this->_aesa.stale = false;
-        return;
-    }
-
-    // Flatten all indexed (non-ghost) points in canonical query traversal order:
-    //   cluster 0 centroid, cluster 0 bucket[0..], cluster 1 centroid, ...
-    // cluster_centroid_row[i] is the row offset of cluster i's centroid.
-    struct point_ref { const object_t* obj; };
-    std::vector<point_ref> pts;
-    this->_aesa.cluster_centroid_row.assign(this->_list.size(), 0u);
-    for (std::size_t ci = 0; ci < this->_list.size(); ++ci) {
-        const auto &c = this->_list[ci];
-        const auto &cc = c.centroid();
-        this->_aesa.cluster_centroid_row[ci] = static_cast<std::uint32_t>(pts.size());
-        // Centroid row is always present (even for ghost — keeps row indexing
-        // aligned; ghost centroids just consume one row's worth of distances).
-        pts.push_back({ &cc.object() });
-        for (const auto &m : c.bucket()) pts.push_back({ &m.object() });
-    }
-    const std::size_t N = pts.size();
-    const std::size_t k = this->_aesa.k_anchors;
-    if (N == 0) { this->_aesa.stale = false; return; }
-
-    // 1. Anchor selection via Farthest-First Traversal (Gonzalez 1985).
-    std::mt19937 rng(0xA5A5A5A5u);
-    std::uniform_int_distribution<std::size_t> pick(0, N - 1);
-    const std::size_t first = pick(rng);
-
-    this->_aesa.anchors.clear();
-    this->_aesa.anchors.reserve(k);
-    this->_aesa.anchors.emplace_back(*pts[first].obj, 0u);
-
-    std::vector<double> min_to_anchor(N, std::numeric_limits<double>::infinity());
-    for (std::size_t i = 0; i < N; ++i)
-        min_to_anchor[i] = this->_metric(*pts[i].obj, *pts[first].obj);
-
-    while (this->_aesa.anchors.size() < k && this->_aesa.anchors.size() < N) {
-        std::size_t best = 0;
-        double best_d = -1.0;
-        for (std::size_t i = 0; i < N; ++i)
-            if (min_to_anchor[i] > best_d) { best_d = min_to_anchor[i]; best = i; }
-        const auto &new_anchor = *pts[best].obj;
-        this->_aesa.anchors.emplace_back(new_anchor, 0u);
-        for (std::size_t i = 0; i < N; ++i) {
-            const double d = this->_metric(*pts[i].obj, new_anchor);
-            if (d < min_to_anchor[i]) min_to_anchor[i] = d;
-        }
-    }
-    const std::size_t actual_k = this->_aesa.anchors.size();
-    this->_aesa.k_anchors = actual_k;
-
-    // 2. N × k distance table.
-    this->_aesa.dists.assign(N * actual_k, 0.0);
-    for (std::size_t i = 0; i < N; ++i) {
-        for (std::size_t j = 0; j < actual_k; ++j)
-            this->_aesa.dists[i * actual_k + j] =
-                this->_metric(*pts[i].obj, this->_aesa.anchors[j].object());
-    }
-    this->_aesa.stale = false;
 }
 
 }  // namespace metric

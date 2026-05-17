@@ -1,0 +1,6 @@
+# Jina v2 base English embeddings - pinned HuggingFace revision.
+# Update revision: with the current main-branch SHA from
+# https://huggingface.co/jinaai/jina-embeddings-v2-base-en/commits/main
+# and re-run build_corpus.py to refresh the cache.
+model:    jinaai/jina-embeddings-v2-base-en
+revision: 322d4d7e2f35e84137961a65af894fda0385eb7a

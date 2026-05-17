@@ -1,0 +1,22 @@
+# Pinned arXiv IDs for the bench corpus.
+# Each non-comment line is one arXiv ID. The build_corpus.py script downloads,
+# extracts, chunks, and embeds these into bench/data/embeddings.npy.
+#
+# Vetted starter set: well-known papers in ML / NLP / similarity search.
+# Adjust as needed; SHA256 of each downloaded PDF is recorded in
+# bench/data/pdf_sha256.txt for reproducibility.
+1706.03762   # Attention is All You Need (transformer)
+1810.04805   # BERT
+1908.10084   # Sentence-BERT
+2310.19923   # Jina Embeddings 2
+1603.09320   # HNSW (Malkov & Yashunin)
+2007.00808   # DiskANN
+2104.08663   # GPL (dense retrieval pretraining)
+1907.11692   # RoBERTa
+2005.14165   # GPT-3
+1907.10597   # Green AI
+2302.13971   # LLaMA
+2104.13533   # SimCSE
+2309.07597   # BGE / C-Pack
+2204.10628   # Open Pretrained Transformer (OPT)
+2106.04561   # Contriever

@@ -1,0 +1,5 @@
+pdfs/
+text/
+embeddings.npy
+chunks.jsonl
+pdf_sha256.txt

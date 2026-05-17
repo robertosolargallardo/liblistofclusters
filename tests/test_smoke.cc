@@ -44,7 +44,6 @@ public:
     using idx_type = listofclusters<O, M, B, V>;
     static const auto& centers_soa(const idx_type &i) noexcept { return i._centers; }
     static const auto& list(const idx_type &i) noexcept { return i._list; }
-    static const auto& aesa(const idx_type &i) noexcept { return i._aesa; }
 };
 }  // namespace metric
 
@@ -573,110 +572,6 @@ static void test_simd_batched_euclidean_matches_scalar()
     std::cout << "  test_simd_batched_euclidean_matches_scalar: OK (n=" << n << ", dim=" << dim << ")\n";
 }
 
-// Phase 4: with AESA on, kNN recall must remain 1.000 against brute force.
-// The LB filter is a lower bound; pruning when LB >= radius is exact.
-static void test_aesa_knn_recall_preserved()
-{
-    constexpr std::uint32_t N = 300U;
-    constexpr std::size_t D = 6U;
-    constexpr std::size_t k = 5U;
-
-    std::vector<vec_t> db(N);
-    std::vector<std::uint32_t> ids(N);
-    std::mt19937 rng(127);
-    std::uniform_real_distribution<double> u(-1.0, 1.0);
-    for (std::uint32_t i = 0; i < N; ++i) {
-        db[i].resize(D);
-        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
-        ids[i] = i;
-    }
-
-    idx_t idx;
-    idx.bulk_build(db, ids);
-    idx.build_aesa(8);
-    assert(!lc_access::aesa(idx).stale);
-
-    int hits = 0, expected = 0;
-    for (int q = 0; q < 15; ++q) {
-        vec_t query(D);
-        for (std::size_t j = 0; j < D; ++j) query[j] = u(rng);
-        std::vector<std::pair<double, std::uint32_t>> bf;
-        bf.reserve(N);
-        for (std::uint32_t i = 0; i < N; ++i) bf.emplace_back(bf_dist(query, db[i]), i);
-        std::sort(bf.begin(), bf.end());
-        std::vector<std::uint32_t> want;
-        for (std::size_t i = 0; i < k; ++i) want.push_back(bf[i].second);
-        auto res = idx.knn_search(query, N + q, k);
-        std::vector<std::uint32_t> got;
-        for (const auto &r : res.results()) got.push_back(r.id());
-        std::sort(want.begin(), want.end());
-        std::sort(got.begin(), got.end());
-        for (auto id : want) {
-            if (std::find(got.begin(), got.end(), id) != got.end()) ++hits;
-            ++expected;
-        }
-    }
-    assert(hits == expected && "AESA filter regressed recall");
-    std::cout << "  test_aesa_knn_recall_preserved: OK (" << hits << "/" << expected << ")\n";
-}
-
-// Phase 4: LB(q,p) = max_i |d(q,a_i) - d(p,a_i)| must never exceed the true
-// d(q,p). Sanity check on random query/point pairs.
-static void test_aesa_lower_bound_holds()
-{
-    constexpr std::uint32_t N = 80U;
-    constexpr std::size_t D = 6U;
-
-    std::vector<vec_t> db(N);
-    std::vector<std::uint32_t> ids(N);
-    std::mt19937 rng(101);
-    std::uniform_real_distribution<double> u(-1.0, 1.0);
-    for (std::uint32_t i = 0; i < N; ++i) {
-        db[i].resize(D);
-        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
-        ids[i] = i;
-    }
-
-    idx_t idx;
-    idx.bulk_build(db, ids);
-    idx.build_aesa(8);
-
-    const auto &table = lc_access::aesa(idx);
-    assert(table.k_anchors > 0);
-    assert(!table.stale);
-
-    // Walk all rows of the dists table (centroids + bucket members in
-    // canonical traversal order) and check LB <= true d(q, point) for each.
-    // The point object corresponding to each row lives in the cluster list
-    // — reconstruct by walking _list in the same order refresh_aesa_ did.
-    for (int t = 0; t < 30; ++t) {
-        vec_t qv(D);
-        for (std::size_t j = 0; j < D; ++j) qv[j] = u(rng);
-        std::vector<double> dqa(table.k_anchors);
-        for (std::size_t i = 0; i < table.k_anchors; ++i)
-            dqa[i] = bf_dist(qv, table.anchors[i].object());
-
-        const auto &list = lc_access::list(idx);
-        std::size_t row_idx = 0;
-        for (const auto &c : list) {
-            auto check = [&](const vec_t &pt) {
-                const double true_d = bf_dist(qv, pt);
-                const double *row = &table.dists[row_idx * table.k_anchors];
-                double lb = 0.0;
-                for (std::size_t i = 0; i < table.k_anchors; ++i) {
-                    const double diff = std::abs(dqa[i] - row[i]);
-                    if (diff > lb) lb = diff;
-                }
-                assert(lb <= true_d + 1e-9 && "AESA lower bound exceeds true distance");
-                ++row_idx;
-            };
-            check(c.centroid().object());
-            for (const auto &m : c.bucket()) check(m.object());
-        }
-    }
-    std::cout << "  test_aesa_lower_bound_holds: OK\n";
-}
-
 // Phase 3.1: both build strategies must yield recall=1.000 against brute force.
 // The legacy first_unassigned path stays available for paper-faithful repro.
 static void test_bulk_build_strategies()
@@ -809,8 +704,6 @@ int main()
     test_simd_batched_euclidean_matches_scalar();
     test_simd_batched_l1_linf_match_scalar();
     test_bulk_build_strategies();
-    test_aesa_lower_bound_holds();
-    test_aesa_knn_recall_preserved();
     test_centers_soa_consistency();
     test_build_and_knn();
     test_range_search();
