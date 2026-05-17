@@ -38,14 +38,25 @@ public:
     typedef cluster<object_t>         cluster_t;
     typedef std::vector<cluster_t>    list_t;
 
-    // Side structure: contiguous row-major matrix of cluster centroids.
-    // Kept in sync with _list and rebuilt lazily on the first query that
-    // needs it (or eagerly via freeze()). Invalidated by insert/remove.
+    // Side structure: contiguous row-major matrix of ALL indexed points
+    // (centroids + bucket members) in canonical query traversal order.
+    // cluster_centroid_row[ci] is the row offset of cluster ci's centroid;
+    // bucket member j of cluster ci is at cluster_centroid_row[ci] + 1 + j.
+    //
+    // Lets the entire per-query distance work happen in one batched SIMD
+    // pass (Faiss-style FlatL2 inner loop) instead of N_buckets scalar
+    // metric calls. The LC build-order traversal still drives correctness
+    // (insertion-order walk, triangle-inequality filter, early termination
+    // per Chavez & Navarro 2005 §4), only the distance compute is batched.
+    //
+    // Kept in sync with _list and rebuilt lazily; invalidated by insert/remove.
     struct centers_soa_t {
-        std::vector<double> data;
-        std::size_t         dim   = 0;
-        std::size_t         n     = 0;
-        bool                stale = true;
+        std::vector<double>        data;
+        std::vector<std::uint32_t> cluster_centroid_row;
+        std::size_t                dim   = 0;
+        std::size_t                n     = 0;        // total point count (rows)
+        std::size_t                n_clusters = 0;
+        bool                       stale = true;
     };
 
 private:
@@ -375,38 +386,57 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::range_search(resu
     const uint32_t qid = _results.centroid().id();
     if (this->_list.empty()) return;
 
-    auto process_cluster = [&](const cluster_t &c, double d) -> bool {
-        const internal_object_t &cc = c.centroid();
-        if((d - _radius) <= c.radius()) {
-            if(d <= _radius && !cc.ghost() && cc.id() != qid)
-                _results.push(cc.object(), cc.id(), d);
-            for(const auto &o : c.bucket()) {
-                if((d - _radius) > o.distance() || (d + _radius) < o.distance())
-                    continue;
-                const double md = this->_metric(q, o.object());
-                if(md <= _radius && o.id() != qid)
-                    _results.push(o.object(), o.id(), md);
-            }
-        }
-        // LC build-order early-termination invariant (Chavez & Navarro 2005 §4).
-        return ((d + _radius) <= c.radius());
-    };
-
     if constexpr (supports_batched_distance_v<distance_t, object_t>) {
         if (this->_centers.stale) this->refresh_centers_soa_();
-        auto d_centers = detail::batched_distance(
+        auto d_all = detail::batched_distance(
             this->_metric, q,
             std::span<const double>(this->_centers.data.data(), this->_centers.data.size()),
             this->_centers.dim, this->_centers.n);
-        for (std::size_t i = 0; i < this->_centers.n; ++i) {
-            if (process_cluster(this->_list[i], d_centers[i])) return;
+
+        const std::size_t n_clusters = this->_list.size();
+        for (std::size_t i = 0; i < n_clusters; ++i) {
+            const auto &c = this->_list[i];
+            const std::size_t base = this->_centers.cluster_centroid_row[i];
+            const double d = d_all[base];
+            const internal_object_t &cc = c.centroid();
+
+            if ((d - _radius) <= c.radius()) {
+                if (d <= _radius && !cc.ghost() && cc.id() != qid)
+                    _results.push(cc.object(), cc.id(), d);
+                std::size_t bi = 0;
+                for (const auto &o : c.bucket()) {
+                    if ((d - _radius) > o.distance() || (d + _radius) < o.distance()) {
+                        ++bi; continue;
+                    }
+                    const double md = d_all[base + 1 + bi];
+                    if (md <= _radius && o.id() != qid)
+                        _results.push(o.object(), o.id(), md);
+                    ++bi;
+                }
+            }
+            // LC build-order early-termination invariant (Chavez & Navarro 2005 §4).
+            if ((d + _radius) <= c.radius()) return;
         }
         return;
     }
 
+    // Scalar fallback.
     for (const auto &c : this->_list) {
         const double d = this->_metric(q, c.centroid().object());
-        if (process_cluster(c, d)) return;
+        const internal_object_t &cc = c.centroid();
+        if ((d - _radius) <= c.radius()) {
+            if (d <= _radius && !cc.ghost() && cc.id() != qid)
+                _results.push(cc.object(), cc.id(), d);
+            for (const auto &o : c.bucket()) {
+                if ((d - _radius) > o.distance() || (d + _radius) < o.distance())
+                    continue;
+                const double md = detail::distance_with_threshold(
+                    this->_metric, q, o.object(), _radius);
+                if (md <= _radius && o.id() != qid)
+                    _results.push(o.object(), o.id(), md);
+            }
+        }
+        if ((d + _radius) <= c.radius()) return;
     }
 }
 
@@ -455,59 +485,77 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
 
     if (this->_list.empty()) return results;
 
-    // Current pruning radius: the kth-best distance once we've accumulated
-    // k results, otherwise infinity.
     double radius = MAX_RADIUS;
     auto refresh_radius = [&]() {
         if (results.size() >= _k)
             radius = std::prev(results.results().end())->distance();
     };
 
-    // Per-cluster walk, sharing the precomputed d(q, centroid_i) passed in.
-    auto process_cluster = [&](const cluster_t &c, double d) -> bool {
-        const internal_object_t &cc = c.centroid();
-        if (d < radius && !cc.ghost() && cc.id() != qid) {
-            results.push(cc.object(), cc.id(), d);
-            refresh_radius();
-        }
-        if ((d - radius) <= c.radius()) {
-            for (const auto &m : c.bucket()) {
-                if ((d - radius) > m.distance() || (d + radius) < m.distance())
-                    continue;
-                const double md = this->_metric(q, m.object());
-                if (md < radius && m.id() != qid) {
-                    results.push(m.object(), m.id(), md);
-                    refresh_radius();
-                }
-            }
-        }
-        return ((d + radius) <= c.radius());
-    };
-
-    // Phase 1 (P1): compute d(q, all_centers) in one batched pass and walk
-    // in insertion order. The batched call wins through contiguous-memory
-    // access (and SIMD overloads in Phase 2). Walk order is INSERTION-ORDER,
-    // not nearest-first, because LC's early-termination invariant
-    // ((d + radius) <= c.radius() ⇒ no later cluster contains qualifying
-    // points) is build-order-dependent (Chavez & Navarro 2005 §4) and breaks
-    // under arbitrary cluster reordering.
+    // Batched-distance fast path: one SIMD pass computes d(q, p) for every
+    // indexed point in the corpus. The LC machinery (insertion-order walk,
+    // triangle-inequality bucket filter, build-order early termination)
+    // then runs over the precomputed distance vector — no scalar metric
+    // calls in the bucket walk. Stays EXACT; this is exactly what Faiss's
+    // FlatL2 does but preserves LC's pruning structure to bypass clusters
+    // whose ball doesn't intersect the query.
     if constexpr (supports_batched_distance_v<distance_t, object_t>) {
         if (this->_centers.stale) this->refresh_centers_soa_();
-        auto d_centers = detail::batched_distance(
+        auto d_all = detail::batched_distance(
             this->_metric, q,
             std::span<const double>(this->_centers.data.data(), this->_centers.data.size()),
             this->_centers.dim, this->_centers.n);
 
-        for (std::size_t i = 0; i < this->_centers.n; ++i) {
-            if (process_cluster(this->_list[i], d_centers[i])) break;
+        const std::size_t n_clusters = this->_list.size();
+        for (std::size_t i = 0; i < n_clusters; ++i) {
+            const auto &c = this->_list[i];
+            const std::size_t base = this->_centers.cluster_centroid_row[i];
+            const double d = d_all[base];
+            const internal_object_t &cc = c.centroid();
+
+            if (d < radius && !cc.ghost() && cc.id() != qid) {
+                results.push(cc.object(), cc.id(), d);
+                refresh_radius();
+            }
+            if ((d - radius) <= c.radius()) {
+                std::size_t bi = 0;
+                for (const auto &m : c.bucket()) {
+                    if ((d - radius) > m.distance() || (d + radius) < m.distance()) {
+                        ++bi; continue;
+                    }
+                    const double md = d_all[base + 1 + bi];
+                    if (md < radius && m.id() != qid) {
+                        results.push(m.object(), m.id(), md);
+                        refresh_radius();
+                    }
+                    ++bi;
+                }
+            }
+            if ((d + radius) <= c.radius()) break;
         }
         return results;
     } else {
-        // Scalar fallback for non-batched metrics (Levenshtein, custom):
-        // same shape, the metric functor is called per-cluster.
+        // Scalar fallback (Levenshtein, custom): adaptive early-abandon
+        // bucket walk.
         for (const auto &c : this->_list) {
             const double d = this->_metric(q, c.centroid().object());
-            if (process_cluster(c, d)) break;
+            const internal_object_t &cc = c.centroid();
+            if (d < radius && !cc.ghost() && cc.id() != qid) {
+                results.push(cc.object(), cc.id(), d);
+                refresh_radius();
+            }
+            if ((d - radius) <= c.radius()) {
+                for (const auto &m : c.bucket()) {
+                    if ((d - radius) > m.distance() || (d + radius) < m.distance())
+                        continue;
+                    const double md = detail::distance_with_threshold(
+                        this->_metric, q, m.object(), radius);
+                    if (md < radius && m.id() != qid) {
+                        results.push(m.object(), m.id(), md);
+                        refresh_radius();
+                    }
+                }
+            }
+            if ((d + radius) <= c.radius()) break;
         }
         return results;
     }
@@ -532,21 +580,144 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
     unsigned nthreads) const
 {
     std::vector<resultslist_t> results(queries.size());
-    if (queries.empty()) return results;
+    if (queries.empty() || this->_list.empty()) return results;
 
     if (nthreads == 0)
         nthreads = std::max(1u, std::thread::hardware_concurrency());
     if (nthreads > queries.size())
         nthreads = static_cast<unsigned>(queries.size());
 
-    // Fast path: a single-threaded batch avoids std::thread overhead and
-    // is equivalent to a manual loop of knn_search calls.
+    // Cache-blocked batched pairwise path: when the metric supports batching,
+    // compute the (Q × N) distance matrix in a SINGLE point-outer/query-inner
+    // pass so the N×D corpus is read once and reused across all Q queries.
+    // This is the standard Faiss-FlatL2 trick. Each query then runs an LC
+    // walk over its row of precomputed distances — no scalar metric calls.
+    if constexpr (supports_batched_distance_v<distance_t, object_t>) {
+        if (this->_centers.stale) this->refresh_centers_soa_();
+        const std::size_t Q = queries.size();
+        const std::size_t N = this->_centers.n;
+        const std::size_t D = this->_centers.dim;
+
+        // Pack queries into a contiguous Q×D matrix.
+        std::vector<double> queries_flat(Q * D);
+        for (std::size_t i = 0; i < Q; ++i) {
+            const auto &qv = queries[i];
+            for (std::size_t j = 0; j < D; ++j)
+                queries_flat[i * D + j] = static_cast<double>(qv[j]);
+        }
+
+        // ONE big SIMD pass: Q×N distance matrix. Cost ~ Q*N*D ops, but the
+        // N*D-byte corpus is streamed only once instead of Q times.
+        // Parallelized over POINT chunks — each thread handles a slice of
+        // rows, computing distances to all Q queries for those rows. Output
+        // matrix is stored Q×N row-major, so threads write to disjoint
+        // columns of each row (no contention, but column stride means each
+        // thread touches the entire output — fine for L2-sized output).
+        std::vector<double> d_qn(Q * N);
+        auto run_pairwise = [&](std::size_t p0, std::size_t p1) {
+            if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
+                auto chunk = detail::batched_pairwise_distance_euclidean(
+                    std::span<const double>(queries_flat.data(), queries_flat.size()),
+                    std::span<const double>(this->_centers.data.data() + p0 * D, (p1 - p0) * D),
+                    D, Q, p1 - p0);
+                // chunk is Q × (p1-p0) row-major. Splat back into d_qn.
+                for (std::size_t qi = 0; qi < Q; ++qi)
+                    std::copy(chunk.data() + qi * (p1 - p0),
+                              chunk.data() + (qi + 1) * (p1 - p0),
+                              d_qn.data() + qi * N + p0);
+            } else {
+                auto chunk = detail::batched_pairwise_distance<distance_t, object_t>(
+                    this->_metric,
+                    std::span<const double>(queries_flat.data(), queries_flat.size()),
+                    std::span<const double>(this->_centers.data.data() + p0 * D, (p1 - p0) * D),
+                    D, Q, p1 - p0);
+                for (std::size_t qi = 0; qi < Q; ++qi)
+                    std::copy(chunk.data() + qi * (p1 - p0),
+                              chunk.data() + (qi + 1) * (p1 - p0),
+                              d_qn.data() + qi * N + p0);
+            }
+        };
+        if (nthreads <= 1) {
+            run_pairwise(0, N);
+        } else {
+            const std::size_t pchunk = (N + nthreads - 1) / nthreads;
+            std::vector<std::thread> ts;
+            ts.reserve(nthreads);
+            for (unsigned t = 0; t < nthreads; ++t) {
+                const std::size_t p0 = t * pchunk;
+                const std::size_t p1 = std::min(p0 + pchunk, N);
+                if (p0 >= p1) break;
+                ts.emplace_back([&, p0, p1]() { run_pairwise(p0, p1); });
+            }
+            for (auto &t : ts) t.join();
+        }
+
+        const std::size_t n_clusters = this->_list.size();
+        auto walk_one = [&](std::size_t i) {
+            const std::uint32_t qid = start_qid + static_cast<std::uint32_t>(i);
+            auto &res = results[i];
+            res = resultslist_t(internal_object_t(queries[i], qid), k);
+            const double *d_row = d_qn.data() + i * N;
+
+            double radius = MAX_RADIUS;
+            auto refresh = [&]() {
+                if (res.size() >= k)
+                    radius = std::prev(res.results().end())->distance();
+            };
+
+            for (std::size_t ci = 0; ci < n_clusters; ++ci) {
+                const auto &c = this->_list[ci];
+                const std::size_t base = this->_centers.cluster_centroid_row[ci];
+                const double d = d_row[base];
+                const internal_object_t &cc = c.centroid();
+
+                if (d < radius && !cc.ghost() && cc.id() != qid) {
+                    res.push(cc.object(), cc.id(), d);
+                    refresh();
+                }
+                if ((d - radius) <= c.radius()) {
+                    std::size_t bi = 0;
+                    for (const auto &m : c.bucket()) {
+                        if ((d - radius) > m.distance() || (d + radius) < m.distance()) {
+                            ++bi; continue;
+                        }
+                        const double md = d_row[base + 1 + bi];
+                        if (md < radius && m.id() != qid) {
+                            res.push(m.object(), m.id(), md);
+                            refresh();
+                        }
+                        ++bi;
+                    }
+                }
+                if ((d + radius) <= c.radius()) break;
+            }
+        };
+
+        if (nthreads <= 1) {
+            for (std::size_t i = 0; i < Q; ++i) walk_one(i);
+        } else {
+            const std::size_t chunk = (Q + nthreads - 1) / nthreads;
+            std::vector<std::thread> ts;
+            ts.reserve(nthreads);
+            for (unsigned t = 0; t < nthreads; ++t) {
+                const std::size_t q0 = t * chunk;
+                const std::size_t q1 = std::min(q0 + chunk, Q);
+                if (q0 >= q1) break;
+                ts.emplace_back([&, q0, q1]() {
+                    for (std::size_t i = q0; i < q1; ++i) walk_one(i);
+                });
+            }
+            for (auto &t : ts) t.join();
+        }
+        return results;
+    }
+
+    // Scalar fallback: original parallel per-query knn_search loop.
     if (nthreads == 1) {
         for (std::size_t i = 0; i < queries.size(); ++i)
             results[i] = this->knn_search(queries[i], start_qid + static_cast<std::uint32_t>(i), k);
         return results;
     }
-
     const std::size_t Q = queries.size();
     const std::size_t chunk = (Q + nthreads - 1) / nthreads;
     std::vector<std::thread> ts;
@@ -572,22 +743,43 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::refresh_centers_soa_() const
 {
-    const std::size_t n = this->_list.size();
-    _centers.n = n;
-    if (n == 0) {
+    const std::size_t n_clusters = this->_list.size();
+    _centers.n_clusters = n_clusters;
+    _centers.cluster_centroid_row.clear();
+    _centers.cluster_centroid_row.reserve(n_clusters);
+    if (n_clusters == 0) {
         _centers.data.clear();
         _centers.dim = 0;
+        _centers.n = 0;
         _centers.stale = false;
         return;
     }
     const auto &first = this->_list[0].centroid().object();
     const std::size_t dim = std::size(first);
     _centers.dim = dim;
-    _centers.data.assign(n * dim, 0.0);
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto &obj = this->_list[i].centroid().object();
+
+    // First pass: count total rows and record cluster_centroid_row offsets.
+    std::size_t row = 0;
+    for (const auto &c : this->_list) {
+        _centers.cluster_centroid_row.push_back(static_cast<std::uint32_t>(row));
+        row += 1 + c.bucket().size();  // centroid + bucket members
+    }
+    _centers.n = row;
+    _centers.data.assign(_centers.n * dim, 0.0);
+
+    // Second pass: copy points in canonical traversal order.
+    row = 0;
+    for (const auto &c : this->_list) {
+        const auto &cobj = c.centroid().object();
         for (std::size_t j = 0; j < dim; ++j)
-            _centers.data[i * dim + j] = static_cast<double>(obj[j]);
+            _centers.data[row * dim + j] = static_cast<double>(cobj[j]);
+        ++row;
+        for (const auto &m : c.bucket()) {
+            const auto &mobj = m.object();
+            for (std::size_t j = 0; j < dim; ++j)
+                _centers.data[row * dim + j] = static_cast<double>(mobj[j]);
+            ++row;
+        }
     }
     _centers.stale = false;
 }

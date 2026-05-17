@@ -622,6 +622,43 @@ static void test_bulk_build_strategies()
     check_recall(idx_t::build_strategy::farthest_first,   "farthest_first");
 }
 
+// Adaptive triangle inequality: distance_with_threshold must return the
+// true distance when d <= threshold, and +inf when d > threshold. Exact.
+static void test_distance_with_threshold_exact()
+{
+    using v_t = std::vector<double>;
+    const v_t a = {0.0, 0.0, 0.0, 0.0};
+    const v_t b = {1.0, 2.0, 2.0, 0.0};  // d = sqrt(1+4+4) = 3
+
+    auto approx = [](double x, double y) { return std::abs(x - y) < 1e-9; };
+
+    // Below threshold: returns true distance.
+    const double r1 = metric::detail::distance_with_threshold(metric::euclidean{}, a, b, 3.5);
+    assert(approx(r1, 3.0));
+
+    // At threshold: still returns true distance (3.0 < 3.0+eps is fine).
+    const double r2 = metric::detail::distance_with_threshold(metric::euclidean{}, a, b, 3.0001);
+    assert(approx(r2, 3.0));
+
+    // Above threshold: abandons, returns +inf.
+    const double r3 = metric::detail::distance_with_threshold(metric::euclidean{}, a, b, 2.5);
+    assert(std::isinf(r3));
+
+    // Manhattan: |1|+|2|+|2|+|0| = 5
+    const double rm = metric::detail::distance_with_threshold(metric::manhattan{}, a, b, 5.5);
+    assert(approx(rm, 5.0));
+    const double rm2 = metric::detail::distance_with_threshold(metric::manhattan{}, a, b, 4.0);
+    assert(std::isinf(rm2));
+
+    // Chebyshev: max(1, 2, 2, 0) = 2
+    const double rc = metric::detail::distance_with_threshold(metric::chebyshev{}, a, b, 2.5);
+    assert(approx(rc, 2.0));
+    const double rc2 = metric::detail::distance_with_threshold(metric::chebyshev{}, a, b, 1.5);
+    assert(std::isinf(rc2));
+
+    std::cout << "  test_distance_with_threshold_exact: OK\n";
+}
+
 // Phase 2.3: SIMD L1 / L∞ batched kernels must match the scalar functor.
 static void test_simd_batched_l1_linf_match_scalar()
 {
@@ -680,11 +717,26 @@ static void test_centers_soa_consistency()
     const auto &soa = lc_access::centers_soa(idx);
     const auto &list = lc_access::list(idx);
     assert(!soa.stale);
-    assert(soa.n == list.size());
+    assert(soa.n_clusters == list.size());
     assert(soa.dim == D);
-    for (std::size_t i = 0; i < list.size(); ++i)
+    // soa.n is total point count (centroids + bucket members) and equals
+    // sum over clusters of (1 + bucket_size). For each cluster i, the
+    // centroid sits at row cluster_centroid_row[i] and bucket members
+    // follow contiguously.
+    std::size_t expected_n = 0;
+    for (const auto &c : list) expected_n += 1 + c.bucket().size();
+    assert(soa.n == expected_n);
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        const std::size_t base = soa.cluster_centroid_row[i];
         for (std::size_t j = 0; j < D; ++j)
-            assert(soa.data[i * D + j] == list[i].centroid().object()[j]);
+            assert(soa.data[base * D + j] == list[i].centroid().object()[j]);
+        std::size_t bi = 0;
+        for (const auto &m : list[i].bucket()) {
+            for (std::size_t j = 0; j < D; ++j)
+                assert(soa.data[(base + 1 + bi) * D + j] == m.object()[j]);
+            ++bi;
+        }
+    }
 
     // Stale flag must flip on online edit.
     idx.insert(db[0], 9999U);
@@ -703,6 +755,7 @@ int main()
     test_scalar_batched_distance();
     test_simd_batched_euclidean_matches_scalar();
     test_simd_batched_l1_linf_match_scalar();
+    test_distance_with_threshold_exact();
     test_bulk_build_strategies();
     test_centers_soa_consistency();
     test_build_and_knn();

@@ -66,20 +66,18 @@ def time_call(fn):
     return out, t1 - t0
 
 
-def run_listofclusters(db, queries, k, *, nthreads=1, build_log=None):
+def build_listofclusters(db):
     import listofclusters
     idx = listofclusters.Index(metric="euclidean")
     ids = np.arange(db.shape[0], dtype=np.uint32)
     db_c = np.ascontiguousarray(db, dtype=np.float64)
-    q_c = np.ascontiguousarray(queries, dtype=np.float64)
-
-    t0 = time.perf_counter()
     idx.bulk_build(db_c, ids)
     idx.freeze()
-    build_s = time.perf_counter() - t0
-    if build_log is not None:
-        build_log.append(build_s)
+    return idx
 
+
+def run_listofclusters(idx, queries, k, *, nthreads=1):
+    q_c = np.ascontiguousarray(queries, dtype=np.float64)
     nbrs2d, _ = idx.batch_knn(q_c, k=k, nthreads=nthreads)
     out = np.zeros((len(queries), k), dtype=np.uint32)
     for i, row in enumerate(nbrs2d):
@@ -106,35 +104,45 @@ def _set_faiss_threads(n):
             pass
 
 
-def run_faiss_flatip(db, queries, k, threads=1):
+def build_faiss_flatip(db):
     import faiss
-    _set_faiss_threads(threads)
     index = faiss.IndexFlatIP(db.shape[1])
     index.add(db)
+    return index
+
+
+def run_faiss_flatip(index, queries, k, threads=1):
+    _set_faiss_threads(threads)
     return index.search(queries, k)[1]
 
 
-def run_faiss_ivf(db, queries, k, nprobe, threads=1):
+def build_faiss_ivf(db, nprobe):
     import faiss
-    _set_faiss_threads(threads)
     nlist = max(4, int(np.sqrt(db.shape[0])))
     quant = faiss.IndexFlatIP(db.shape[1])
     index = faiss.IndexIVFFlat(quant, db.shape[1], nlist, faiss.METRIC_INNER_PRODUCT)
     index.train(db)
     index.add(db)
     index.nprobe = min(nprobe, nlist)
+    return index
+
+
+def run_faiss_ivf(index, queries, k, threads=1):
+    _set_faiss_threads(threads)
     return index.search(queries, k)[1]
 
 
-def run_hnswlib(db, queries, k, ef, threads=1):
+def build_hnswlib(db, ef):
     import hnswlib
-    # hnswlib: threads=0 means "use OpenMP default" in its C++ layer.
-    # threads=1 pins to single-threaded.
-    n = threads if threads > 0 else 0
     index = hnswlib.Index(space="cosine", dim=db.shape[1])
     index.init_index(max_elements=db.shape[0], ef_construction=200, M=16)
-    index.add_items(db, num_threads=n)
+    index.add_items(db, num_threads=0)
     index.set_ef(ef)
+    return index
+
+
+def run_hnswlib(index, queries, k, threads=1):
+    n = threads if threads > 0 else 0
     return index.knn_query(queries, k=k, num_threads=n)[0]
 
 
@@ -152,37 +160,53 @@ def main() -> int:
     truth = brute_truth(db, queries, args.k)
 
     rows = []
-    # Threading is controlled explicitly per method so 1T vs HW threads
-    # comparisons are apples-to-apples. Faiss/hnswlib default to OpenMP
-    # max threads, so 1T rows must pin to 1.
+    # Build indexes once; time only the QUERY phase. Build times reported
+    # separately so we don't penalize methods with expensive builds (LC's
+    # bulk_build is O(N²/m) vs Faiss FlatIP's O(N) memcpy).
+    print(f"\n{'method':<30s}  {'recall@k':>9s}  {'qps':>10s}  {'query s':>8s}  {'build s':>8s}")
+
+    builds = {}
+    bt0 = time.perf_counter()
+    builds["lc"] = build_listofclusters(db);                                            t_lc = time.perf_counter() - bt0
+    bt0 = time.perf_counter()
+    builds["faiss_flat"] = build_faiss_flatip(db);                                      t_ff = time.perf_counter() - bt0
+    bt0 = time.perf_counter()
+    builds["faiss_ivf10"] = build_faiss_ivf(db, 10);                                    t_iv10 = time.perf_counter() - bt0
+    bt0 = time.perf_counter()
+    builds["faiss_ivf32"] = build_faiss_ivf(db, 32);                                    t_iv32 = time.perf_counter() - bt0
+    bt0 = time.perf_counter()
+    builds["hnsw_64"]  = build_hnswlib(db, 64);                                         t_h64  = time.perf_counter() - bt0
+    bt0 = time.perf_counter()
+    builds["hnsw_128"] = build_hnswlib(db, 128);                                        t_h128 = time.perf_counter() - bt0
+
     methods = [
-        ("LC, 1T",                       lambda: run_listofclusters(db, queries, args.k, nthreads=1)),
-        ("LC, HW threads",               lambda: run_listofclusters(db, queries, args.k, nthreads=0)),
-        ("faiss.FlatIP 1T",              lambda: run_faiss_flatip(db, queries, args.k, threads=1)),
-        ("faiss.FlatIP HW",              lambda: run_faiss_flatip(db, queries, args.k, threads=0)),
-        ("faiss.IVFFlat np=10 1T",       lambda: run_faiss_ivf(db, queries, args.k, 10, threads=1)),
-        ("faiss.IVFFlat np=10 HW",       lambda: run_faiss_ivf(db, queries, args.k, 10, threads=0)),
-        ("faiss.IVFFlat np=32 1T",       lambda: run_faiss_ivf(db, queries, args.k, 32, threads=1)),
-        ("faiss.IVFFlat np=32 HW",       lambda: run_faiss_ivf(db, queries, args.k, 32, threads=0)),
-        ("hnswlib ef=64 1T",             lambda: run_hnswlib(db, queries, args.k, 64, threads=1)),
-        ("hnswlib ef=64 HW",             lambda: run_hnswlib(db, queries, args.k, 64, threads=0)),
-        ("hnswlib ef=128 1T",            lambda: run_hnswlib(db, queries, args.k, 128, threads=1)),
-        ("hnswlib ef=128 HW",            lambda: run_hnswlib(db, queries, args.k, 128, threads=0)),
+        ("LC, 1T",                       lambda: run_listofclusters(builds["lc"], queries, args.k, nthreads=1),         t_lc),
+        ("LC, HW threads",               lambda: run_listofclusters(builds["lc"], queries, args.k, nthreads=0),         t_lc),
+        ("faiss.FlatIP 1T",              lambda: run_faiss_flatip(builds["faiss_flat"], queries, args.k, threads=1),    t_ff),
+        ("faiss.FlatIP HW",              lambda: run_faiss_flatip(builds["faiss_flat"], queries, args.k, threads=0),    t_ff),
+        ("faiss.IVFFlat np=10 1T",       lambda: run_faiss_ivf(builds["faiss_ivf10"], queries, args.k, threads=1),      t_iv10),
+        ("faiss.IVFFlat np=10 HW",       lambda: run_faiss_ivf(builds["faiss_ivf10"], queries, args.k, threads=0),      t_iv10),
+        ("faiss.IVFFlat np=32 1T",       lambda: run_faiss_ivf(builds["faiss_ivf32"], queries, args.k, threads=1),      t_iv32),
+        ("faiss.IVFFlat np=32 HW",       lambda: run_faiss_ivf(builds["faiss_ivf32"], queries, args.k, threads=0),      t_iv32),
+        ("hnswlib ef=64 1T",             lambda: run_hnswlib(builds["hnsw_64"], queries, args.k, threads=1),            t_h64),
+        ("hnswlib ef=64 HW",             lambda: run_hnswlib(builds["hnsw_64"], queries, args.k, threads=0),            t_h64),
+        ("hnswlib ef=128 1T",            lambda: run_hnswlib(builds["hnsw_128"], queries, args.k, threads=1),           t_h128),
+        ("hnswlib ef=128 HW",            lambda: run_hnswlib(builds["hnsw_128"], queries, args.k, threads=0),           t_h128),
     ]
-    print(f"\n{'method':<30s}  {'recall@k':>9s}  {'qps':>10s}  {'sec':>8s}")
-    for name, fn in methods:
+    for name, fn, build_s in methods:
         try:
             got, elapsed = time_call(fn)
             qps = queries.shape[0] / elapsed
             r = recall(np.asarray(got), truth)
-            rows.append({"method": name, "recall": float(r), "qps": float(qps), "sec": float(elapsed)})
-            print(f"  {name:<30s}  {r:9.3f}  {qps:10.1f}  {elapsed:8.3f}")
+            rows.append({"method": name, "recall": float(r), "qps": float(qps),
+                         "sec": float(elapsed), "build_s": float(build_s)})
+            print(f"  {name:<30s}  {r:9.3f}  {qps:10.1f}  {elapsed:8.3f}  {build_s:8.3f}")
         except Exception as e:
             print(f"  {name:<30s}  skipped: {e}")
 
     csv_path = Path(__file__).parent / "compare_documents.csv"
     with csv_path.open("w") as f:
-        w = csv.DictWriter(f, fieldnames=["method", "recall", "qps", "sec"])
+        w = csv.DictWriter(f, fieldnames=["method", "recall", "qps", "sec", "build_s"])
         w.writeheader()
         for r in rows:
             w.writerow(r)
