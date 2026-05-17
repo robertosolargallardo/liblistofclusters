@@ -1038,101 +1038,6 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
 
         const std::size_t n_clusters = this->_list.size();
 
-        // -----------------------------------------------------------------
-        // AESA-on-PCA cluster-level pre-filter. Computed ONCE per batch.
-        // Two BLAS-derived matrices give us per-cluster lower bounds:
-        //   - d_qc[q, c]  = d_proj(q, centroid_c)        (pure PCA bound)
-        //   - d_qa[q, k]  = d_proj(q, anchor_k)          (used in AESA bound)
-        // Combined LB:
-        //   LB = max(d_qc[q,c], max_k |d_qa[q,k] - centroid_to_anchor[c,k]|)
-        // Both terms are deterministic LBs on d_full(q, centroid_c), so the
-        // max is a strictly tighter LB. Whole clusters are skipped when
-        // LB > current_radius — saving the bucket walk + future radius work.
-        // SKIPPED when the high-D topk-no-walk path will be taken below,
-        // since the filter is only consulted inside the LC walk.
-        // -----------------------------------------------------------------
-        std::vector<float> d_qc;     // (Q, n_clusters) projected centroid distances
-        std::vector<float> d_qa;     // (Q, K) projected anchor distances
-        std::size_t K_anchors = 0;
-        [[maybe_unused]] const bool will_topk_path = (D >= 128);
-#if defined(LISTOFCLUSTERS_USE_BLAS)
-        if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
-            if (this->_centers.proj_enabled && this->_centers.n_anchors > 0 && !will_topk_path) {
-                K_anchors = this->_centers.n_anchors;
-                const std::size_t Dp = this->_centers.proj_dim;
-                // 1. Pack queries to f32 and center.
-                std::vector<float> q_centered(Q * D);
-                for (std::size_t i = 0; i < Q; ++i) {
-                    const auto &qv = queries[i];
-                    for (std::size_t j = 0; j < D; ++j)
-                        q_centered[i * D + j] = static_cast<float>(qv[j]) - this->_centers.mean_f32[j];
-                }
-                // 2. Project queries to D' (one sgemm).
-                std::vector<float> q_proj(Q * Dp);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            static_cast<int>(Q), static_cast<int>(Dp), static_cast<int>(D),
-                            1.0f, q_centered.data(), static_cast<int>(D),
-                            this->_centers.proj_matrix_f32.data(), static_cast<int>(D),
-                            0.0f, q_proj.data(), static_cast<int>(Dp));
-                // 3. Pre-norms.
-                std::vector<float> q_proj_sq(Q, 0.0f);
-                for (std::size_t i = 0; i < Q; ++i) {
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < Dp; ++j) {
-                        const float v = q_proj[i * Dp + j]; s += v * v;
-                    }
-                    q_proj_sq[i] = s;
-                }
-                // 4. Gather centroid projected vectors + their sq norms.
-                std::vector<float> c_proj(n_clusters * Dp);
-                std::vector<float> c_proj_sq(n_clusters, 0.0f);
-                for (std::size_t ci = 0; ci < n_clusters; ++ci) {
-                    const std::size_t crow = this->_centers.cluster_centroid_row[ci];
-                    const float *src = this->_centers.data_proj_f32.data() + crow * Dp;
-                    std::memcpy(c_proj.data() + ci * Dp, src, Dp * sizeof(float));
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < Dp; ++j) s += src[j] * src[j];
-                    c_proj_sq[ci] = s;
-                }
-                // 5. IP(Q × n_clusters) = q_proj @ c_proj^T  (one sgemm).
-                std::vector<float> ip_qc(Q * n_clusters);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            static_cast<int>(Q), static_cast<int>(n_clusters), static_cast<int>(Dp),
-                            1.0f, q_proj.data(), static_cast<int>(Dp),
-                            c_proj.data(), static_cast<int>(Dp),
-                            0.0f, ip_qc.data(), static_cast<int>(n_clusters));
-                d_qc.assign(Q * n_clusters, 0.0f);
-                for (std::size_t i = 0; i < Q; ++i)
-                    for (std::size_t ci = 0; ci < n_clusters; ++ci) {
-                        float d2 = q_proj_sq[i] - 2.0f * ip_qc[i * n_clusters + ci] + c_proj_sq[ci];
-                        if (d2 < 0.0f) d2 = 0.0f;
-                        d_qc[i * n_clusters + ci] = std::sqrt(d2);
-                    }
-                // 6. Anchor distances (Q × K) — same shape sgemm.
-                std::vector<float> a_proj_sq(K_anchors, 0.0f);
-                for (std::size_t kk = 0; kk < K_anchors; ++kk) {
-                    const float *ap = this->_centers.anchors_proj_f32.data() + kk * Dp;
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < Dp; ++j) s += ap[j] * ap[j];
-                    a_proj_sq[kk] = s;
-                }
-                std::vector<float> ip_qa(Q * K_anchors);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            static_cast<int>(Q), static_cast<int>(K_anchors), static_cast<int>(Dp),
-                            1.0f, q_proj.data(), static_cast<int>(Dp),
-                            this->_centers.anchors_proj_f32.data(), static_cast<int>(Dp),
-                            0.0f, ip_qa.data(), static_cast<int>(K_anchors));
-                d_qa.assign(Q * K_anchors, 0.0f);
-                for (std::size_t i = 0; i < Q; ++i)
-                    for (std::size_t kk = 0; kk < K_anchors; ++kk) {
-                        float d2 = q_proj_sq[i] - 2.0f * ip_qa[i * K_anchors + kk] + a_proj_sq[kk];
-                        if (d2 < 0.0f) d2 = 0.0f;
-                        d_qa[i * K_anchors + kk] = std::sqrt(d2);
-                    }
-            }
-        }
-#endif
-
         // At high D, the LC walk's TI filter prunes nothing and the L2
         // norm-decomposition + per-element sqrt over the full Q×N matrix
         // is wasted work. Instead:
@@ -1285,37 +1190,7 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
                     radius = std::prev(res.results().end())->distance();
             };
 
-            // AESA-on-PCA per-query pointers (null when disabled).
-            const float *d_qc_row = (!d_qc.empty()) ? d_qc.data() + i * n_clusters : nullptr;
-            const float *d_qa_row = (!d_qa.empty()) ? d_qa.data() + i * K_anchors : nullptr;
-            const float *c2a = this->_centers.centroid_to_anchor_f32.data();
-
             for (std::size_t ci = 0; ci < n_clusters; ++ci) {
-                // Cluster-level lower-bound pre-filter. SAFE because both
-                // d_qc and the AESA bound are deterministic LBs on
-                // d_full(q, centroid_ci); their max is also an LB. If LB
-                // exceeds the current shrinking radius, no point in this
-                // cluster can be in the top-k (it can't even contain a
-                // candidate as close as the cluster's centroid is *bounded
-                // below by LB*).
-                if (d_qc_row) {
-                    const float lb_pca = d_qc_row[ci];
-                    float lb_aesa = 0.0f;
-                    const float *c2a_row = c2a + ci * K_anchors;
-                    for (std::size_t kk = 0; kk < K_anchors; ++kk) {
-                        const float diff = std::abs(d_qa_row[kk] - c2a_row[kk]);
-                        if (diff > lb_aesa) lb_aesa = diff;
-                    }
-                    const float lb = (lb_pca > lb_aesa) ? lb_pca : lb_aesa;
-                    // The cluster's farthest point is at distance ≤ d_centroid + c.radius.
-                    // For a candidate to be in top-k, its distance must be ≤ radius,
-                    // which means d_centroid ≥ d_candidate - c.radius ≥ ?? Actually
-                    // we want: if LB(q, centroid) > radius + c.radius, then no point
-                    // in the cluster ball can be within radius of q.
-                    const float skip_thresh = static_cast<float>(radius + this->_list[ci].radius());
-                    if (lb > skip_thresh) continue;
-                }
-
                 const auto &c = this->_list[ci];
                 const std::size_t base = this->_centers.cluster_centroid_row[ci];
                 const double d = d_row[base];
