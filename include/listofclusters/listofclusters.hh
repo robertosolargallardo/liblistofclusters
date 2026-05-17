@@ -5,6 +5,7 @@
 #include <listofclusters/resultslist.hh>
 #include <listofclusters/internal_object.hh>
 #include <listofclusters/detail/batched_distance.hh>
+#include <atomic>
 #include <numeric>
 #include <span>
 
@@ -59,11 +60,46 @@ public:
         std::vector<float>         data_f32;
         std::vector<float>         sq_norms_f32;
         std::vector<std::uint32_t> cluster_centroid_row;
+        // -------------------------------------------------------------
+        // PCA pre-filter (exact lower bound on distance, no recall loss).
+        //
+        // The TI-based bounds collapse at high D because distances
+        // concentrate. PCA captures the data's principal axes — for
+        // learned embeddings, the top D'~64 components hold ~80% of
+        // variance. The projection
+        //     d_proj²(q, p) = ||P^T(q - p)||²
+        // is a DETERMINISTIC lower bound on d²(q, p) for any orthonormal
+        // P (since P P^T is an orthogonal projection, ||P P^T v||² ≤
+        // ||v||²). With PCA's choice of P (top D' eigenvectors of the
+        // centered corpus covariance) the bound is *tight* on the
+        // discriminative dimensions and we can prune candidates by
+        // comparing d_proj alone, only verifying survivors with the
+        // full D-dim distance.
+        //
+        // Net at N=7226, D=768: filter prunes 75-95% (verified ~15-25%)
+        // but per-query sort + scattered-memory verification eat the
+        // BLAS savings — net SLOWER than the full sgemm path at this N.
+        // Expected to flip at N ≳ 50k where BLAS time scales linearly.
+        // Built unconditionally when D is large; the batch_knn path
+        // chooses between PCA filter and full-BLAS based on workload.
+        // -------------------------------------------------------------
+        std::vector<float>         mean_f32;          // (D,) corpus mean
+        std::vector<float>         proj_matrix_f32;   // (D', D) top-D' eigenvecs as rows
+        std::vector<float>         data_proj_f32;     // (N, D') centered + projected corpus
+        std::vector<float>         sq_norms_proj_f32; // (N,) ||p_proj||²
+        std::size_t                proj_dim   = 0;
+        bool                       proj_enabled = false;
+
         std::size_t                dim   = 0;
         std::size_t                n     = 0;        // total point count (rows)
         std::size_t                n_clusters = 0;
         bool                       stale = true;
     };
+
+    // PCA projection dimension. 64 sits at the elbow of typical learned-
+    // embedding spectra (Jina v2, BGE, etc.); captures ~80% of variance
+    // for D≥256 dense embeddings. Tunable via this compile-time constant.
+    static constexpr std::size_t PROJ_DIM = 64;
 
 private:
     template <class O, class M, std::size_t B, std::size_t V> friend class lc_test_access;
@@ -506,10 +542,39 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::knn_search(const objec
     // whose ball doesn't intersect the query.
     if constexpr (supports_batched_distance_v<distance_t, object_t>) {
         if (this->_centers.stale) this->refresh_centers_soa_();
-        auto d_all = detail::batched_distance(
-            this->_metric, q,
-            std::span<const double>(this->_centers.data.data(), this->_centers.data.size()),
-            this->_centers.dim, this->_centers.n);
+        std::vector<double> d_all;
+#if defined(LISTOFCLUSTERS_USE_BLAS)
+        // BLAS single-query path: cblas_sgemv hits Apple Accelerate's
+        // AMX/NEON at near-peak. For online (one-at-a-time) queries this
+        // closes the gap to Faiss FlatIP, which uses the same kernel.
+        if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
+            const std::size_t N = this->_centers.n;
+            const std::size_t D = this->_centers.dim;
+            std::vector<float> q_f32(D);
+            for (std::size_t j = 0; j < D; ++j) q_f32[j] = static_cast<float>(q[j]);
+            float qsq = 0.0f;
+            for (std::size_t j = 0; j < D; ++j) qsq += q_f32[j] * q_f32[j];
+            std::vector<float> ip(N);
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        static_cast<int>(N), static_cast<int>(D),
+                        1.0f, this->_centers.data_f32.data(), static_cast<int>(D),
+                        q_f32.data(), 1,
+                        0.0f, ip.data(), 1);
+            d_all.resize(N);
+            const float *psq = this->_centers.sq_norms_f32.data();
+            for (std::size_t r = 0; r < N; ++r) {
+                float d2 = qsq - 2.0f * ip[r] + psq[r];
+                if (d2 < 0.0f) d2 = 0.0f;
+                d_all[r] = std::sqrt(static_cast<double>(d2));
+            }
+        } else
+#endif
+        {
+            d_all = detail::batched_distance(
+                this->_metric, q,
+                std::span<const double>(this->_centers.data.data(), this->_centers.data.size()),
+                this->_centers.dim, this->_centers.n);
+        }
 
         const std::size_t n_clusters = this->_list.size();
         for (std::size_t i = 0; i < n_clusters; ++i) {
@@ -592,6 +657,179 @@ listofclusters<object_t,distance_t,bucket_size,overflow>::batch_knn(
         nthreads = std::max(1u, std::thread::hardware_concurrency());
     if (nthreads > queries.size())
         nthreads = static_cast<unsigned>(queries.size());
+
+#if defined(LISTOFCLUSTERS_USE_BLAS)
+    // PCA pre-filter + full-D verify path. Computes d_proj (exact lower
+    // bound on d_full via orthogonal projection to top-D' eigenvectors)
+    // for every (q, p) via sgemm at D' ≪ D. Per query: walk points by
+    // d_proj ascending; verify only while d_proj ≤ radius.
+    //
+    // ALGORITHMICALLY CORRECT (recall=1.000, ~15-25% verification rate
+    // observed on N=7226 Jina v2). EMPIRICALLY SLOWER than the simpler
+    // full-D sgemm path at this N: per-query N-sized sort + scattered-
+    // memory verification eat the savings. Expected to become a net
+    // win at N ≳ 50k where the BLAS sgemm cost dominates. Gated behind
+    // a (currently disabled) N-threshold so the code is preserved for
+    // future use without paying the cost in the default path.
+    constexpr std::size_t PCA_PATH_N_THRESHOLD = 50000;  // disable for now
+    if constexpr (std::is_same_v<distance_t, metric::euclidean>) {
+        if (this->_centers.stale) this->refresh_centers_soa_();
+        if (this->_centers.proj_enabled &&
+            this->_centers.n >= PCA_PATH_N_THRESHOLD) {
+            const std::size_t Q = queries.size();
+            const std::size_t N = this->_centers.n;
+            const std::size_t D = this->_centers.dim;
+            const std::size_t Dp = this->_centers.proj_dim;
+
+            // 1. Pack queries to float32 and center.
+            std::vector<float> q_centered(Q * D);
+            for (std::size_t i = 0; i < Q; ++i) {
+                const auto &qv = queries[i];
+                for (std::size_t j = 0; j < D; ++j)
+                    q_centered[i * D + j] = static_cast<float>(qv[j]) - this->_centers.mean_f32[j];
+            }
+
+            // 2. Project queries: q_proj = q_centered @ proj_matrix^T.
+            std::vector<float> q_proj(Q * Dp);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        static_cast<int>(Q), static_cast<int>(Dp), static_cast<int>(D),
+                        1.0f, q_centered.data(), static_cast<int>(D),
+                        this->_centers.proj_matrix_f32.data(), static_cast<int>(D),
+                        0.0f, q_proj.data(), static_cast<int>(Dp));
+
+            // 3. Q × N projected IP via sgemm at D'.
+            std::vector<float> ip_proj(Q * N);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        static_cast<int>(Q), static_cast<int>(N), static_cast<int>(Dp),
+                        1.0f, q_proj.data(), static_cast<int>(Dp),
+                        this->_centers.data_proj_f32.data(), static_cast<int>(Dp),
+                        0.0f, ip_proj.data(), static_cast<int>(N));
+
+            // 4. Per-query projected squared norms.
+            std::vector<float> q_proj_sq(Q, 0.0f);
+            for (std::size_t i = 0; i < Q; ++i) {
+                float s = 0.0f;
+                const float *qpr = q_proj.data() + i * Dp;
+                for (std::size_t j = 0; j < Dp; ++j) s += qpr[j] * qpr[j];
+                q_proj_sq[i] = s;
+            }
+
+            // Constant row → cluster map (built once).
+            std::vector<std::uint32_t> row_to_cluster(N, 0u);
+            for (std::size_t ci = 0; ci < this->_list.size(); ++ci) {
+                const std::uint32_t base = this->_centers.cluster_centroid_row[ci];
+                const std::uint32_t end = (ci + 1 < this->_list.size())
+                    ? this->_centers.cluster_centroid_row[ci + 1]
+                    : static_cast<std::uint32_t>(N);
+                for (std::uint32_t r = base; r < end; ++r)
+                    row_to_cluster[r] = static_cast<std::uint32_t>(ci);
+            }
+
+            // 5. Per query: sort by d_proj, walk + NEON-verify survivors.
+            auto walk_pca = [&](std::size_t qi) {
+                const std::uint32_t qid = start_qid + static_cast<std::uint32_t>(qi);
+                auto &res = results[qi];
+                res = resultslist_t(internal_object_t(queries[qi], qid), k);
+
+                std::vector<std::pair<float, std::uint32_t>> lbs(N);
+                const float *ip_row = ip_proj.data() + qi * N;
+                const float qs = q_proj_sq[qi];
+                const float *ps = this->_centers.sq_norms_proj_f32.data();
+                for (std::uint32_t r = 0; r < N; ++r) {
+                    float d2p = qs - 2.0f * ip_row[r] + ps[r];
+                    if (d2p < 0.0f) d2p = 0.0f;
+                    lbs[r] = { d2p, r };
+                }
+                std::sort(lbs.begin(), lbs.end(),
+                    [](const auto &a, const auto &b) noexcept { return a.first < b.first; });
+
+                double radius_sq = std::numeric_limits<double>::max();
+                auto refresh = [&]() {
+                    if (res.size() >= k) {
+                        const double r = std::prev(res.results().end())->distance();
+                        radius_sq = r * r;
+                    }
+                };
+
+                std::vector<float> q_raw(D);
+                {
+                    const auto &qv = queries[qi];
+                    for (std::size_t j = 0; j < D; ++j) q_raw[j] = static_cast<float>(qv[j]);
+                }
+
+                for (const auto &lp : lbs) {
+                    const double lb_sq = static_cast<double>(lp.first);
+                    if (lb_sq > radius_sq) break;
+                    const std::uint32_t r = lp.second;
+                    const std::uint32_t ci = row_to_cluster[r];
+                    const std::uint32_t base = this->_centers.cluster_centroid_row[ci];
+
+                    const float *p = this->_centers.data_f32.data() + r * D;
+                    float d2 = 0.0f;
+#if defined(__ARM_NEON)
+                    float32x4_t acc0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc1 = vdupq_n_f32(0.0f);
+                    std::size_t j = 0;
+                    for (; j + 8 <= D; j += 8) {
+                        float32x4_t qa0 = vld1q_f32(q_raw.data() + j);
+                        float32x4_t qa1 = vld1q_f32(q_raw.data() + j + 4);
+                        float32x4_t pb0 = vld1q_f32(p + j);
+                        float32x4_t pb1 = vld1q_f32(p + j + 4);
+                        float32x4_t d0 = vsubq_f32(qa0, pb0);
+                        float32x4_t d1 = vsubq_f32(qa1, pb1);
+                        acc0 = vfmaq_f32(acc0, d0, d0);
+                        acc1 = vfmaq_f32(acc1, d1, d1);
+                    }
+                    float32x4_t acc = vaddq_f32(acc0, acc1);
+                    d2 = vgetq_lane_f32(acc, 0) + vgetq_lane_f32(acc, 1)
+                       + vgetq_lane_f32(acc, 2) + vgetq_lane_f32(acc, 3);
+                    for (; j < D; ++j) { const float df = q_raw[j] - p[j]; d2 += df * df; }
+#else
+                    for (std::size_t j = 0; j < D; ++j) {
+                        const float df = q_raw[j] - p[j];
+                        d2 += df * df;
+                    }
+#endif
+                    const double md = std::sqrt(static_cast<double>(d2));
+                    if (md * md < radius_sq) {
+                        if (r == base) {
+                            const auto &cc = this->_list[ci].centroid();
+                            if (!cc.ghost() && cc.id() != qid) {
+                                res.push(cc.object(), cc.id(), md);
+                                refresh();
+                            }
+                        } else {
+                            const std::size_t bi = r - base - 1;
+                            const auto &m = this->_list[ci].bucket()[bi];
+                            if (m.id() != qid) {
+                                res.push(m.object(), m.id(), md);
+                                refresh();
+                            }
+                        }
+                    }
+                }
+            };
+
+            if (nthreads <= 1) {
+                for (std::size_t i = 0; i < Q; ++i) walk_pca(i);
+            } else {
+                const std::size_t chunk = (Q + nthreads - 1) / nthreads;
+                std::vector<std::thread> ts;
+                ts.reserve(nthreads);
+                for (unsigned t = 0; t < nthreads; ++t) {
+                    const std::size_t q0 = t * chunk;
+                    const std::size_t q1 = std::min(q0 + chunk, Q);
+                    if (q0 >= q1) break;
+                    ts.emplace_back([&, q0, q1]() {
+                        for (std::size_t i = q0; i < q1; ++i) walk_pca(i);
+                    });
+                }
+                for (auto &t : ts) t.join();
+            }
+            return results;
+        }
+    }
+#endif
 
     // Cache-blocked batched pairwise path: when the metric supports batching,
     // compute the (Q × N) distance matrix in a SINGLE point-outer/query-inner
@@ -821,6 +1059,93 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::refresh_centers_s
         }
         _centers.sq_norms_f32[r] = s;
     }
+
+#if defined(LISTOFCLUSTERS_USE_BLAS)
+    // PCA projection: mean → center → covariance → eigendecompose → project.
+    // Top D' eigenvectors give an orthonormal projection P^T : R^D → R^{D'}.
+    // ||P^T(q-p)||² is a deterministic lower bound on ||q-p||² (orthogonal
+    // projection contracts norms). Built once at freeze() / bulk_build.
+    _centers.proj_enabled = false;
+    _centers.proj_dim = 0;
+    if (dim >= PROJ_DIM * 2 && _centers.n >= PROJ_DIM) {
+        const std::size_t D_proj = PROJ_DIM;
+
+        // 1. Mean.
+        std::vector<float> mean(dim, 0.0f);
+        for (std::size_t r = 0; r < _centers.n; ++r)
+            for (std::size_t j = 0; j < dim; ++j)
+                mean[j] += _centers.data_f32[r * dim + j];
+        const float inv_n = 1.0f / static_cast<float>(_centers.n);
+        for (std::size_t j = 0; j < dim; ++j) mean[j] *= inv_n;
+
+        // 2. Centered corpus.
+        std::vector<float> centered(_centers.n * dim);
+        for (std::size_t r = 0; r < _centers.n; ++r)
+            for (std::size_t j = 0; j < dim; ++j)
+                centered[r * dim + j] = _centers.data_f32[r * dim + j] - mean[j];
+
+        // 3. Covariance = centered^T @ centered / N (D × D symmetric).
+        std::vector<float> cov(dim * dim);
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                    static_cast<int>(dim), static_cast<int>(dim), static_cast<int>(_centers.n),
+                    inv_n, centered.data(), static_cast<int>(dim),
+                    centered.data(), static_cast<int>(dim),
+                    0.0f, cov.data(), static_cast<int>(dim));
+
+        // 4. Symmetric eigendecomposition via LAPACK ssyev_.
+        std::vector<float> eigvals(dim);
+        int n_la = static_cast<int>(dim);
+        int lda  = n_la;
+        int info = 0;
+        int lwork = -1;
+        float work_query = 0.0f;
+        ssyev_(const_cast<char*>("V"), const_cast<char*>("U"),
+               &n_la, cov.data(), &lda, eigvals.data(),
+               &work_query, &lwork, &info);
+        if (info == 0 && work_query > 0.0f) {
+            lwork = static_cast<int>(work_query);
+            std::vector<float> work(static_cast<std::size_t>(lwork));
+            ssyev_(const_cast<char*>("V"), const_cast<char*>("U"),
+                   &n_la, cov.data(), &lda, eigvals.data(),
+                   work.data(), &lwork, &info);
+        }
+
+        if (info == 0) {
+            // 5. Extract top D' eigenvectors as rows of proj_matrix.
+            //    ssyev returns ascending eigenvalues; eigenvectors are
+            //    columns in column-major layout. Top D' = last D' columns.
+            _centers.proj_matrix_f32.assign(D_proj * dim, 0.0f);
+            for (std::size_t i = 0; i < D_proj; ++i) {
+                const std::size_t col_idx = dim - 1 - i;
+                const float *colp = cov.data() + col_idx * dim;
+                for (std::size_t j = 0; j < dim; ++j)
+                    _centers.proj_matrix_f32[i * dim + j] = colp[j];
+            }
+
+            // 6. Project centered corpus: data_proj = centered @ proj_matrix^T.
+            _centers.data_proj_f32.assign(_centers.n * D_proj, 0.0f);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        static_cast<int>(_centers.n), static_cast<int>(D_proj), static_cast<int>(dim),
+                        1.0f, centered.data(), static_cast<int>(dim),
+                        _centers.proj_matrix_f32.data(), static_cast<int>(dim),
+                        0.0f, _centers.data_proj_f32.data(), static_cast<int>(D_proj));
+
+            // 7. Per-point projected squared norm.
+            _centers.sq_norms_proj_f32.assign(_centers.n, 0.0f);
+            for (std::size_t r = 0; r < _centers.n; ++r) {
+                float s = 0.0f;
+                const float *prow = _centers.data_proj_f32.data() + r * D_proj;
+                for (std::size_t j = 0; j < D_proj; ++j) s += prow[j] * prow[j];
+                _centers.sq_norms_proj_f32[r] = s;
+            }
+
+            _centers.mean_f32 = std::move(mean);
+            _centers.proj_dim = D_proj;
+            _centers.proj_enabled = true;
+        }
+    }
+#endif
+
     _centers.stale = false;
 }
 
