@@ -82,3 +82,79 @@
 2305.13245   # GQA grouped-query attention
 2106.04560   # Switch Transformer
 
+# --- Expanded set (added to push corpus past PCA filter threshold) ----------
+# Retrieval / dense passage
+1904.07531   # MS MARCO
+2007.00808   # DiskANN (already above, here for emphasis on ANN)
+2003.04297   # MoCo
+2002.05709   # SimCLR
+2010.03622   # SimSiam
+2104.09864   # RoPE rotary
+2106.14881   # GLM
+2009.14794   # ColBERT (dup-safe: pypdf dedup by prefix)
+2103.13076   # Decoder-only retrieval
+
+# More embedding / SBERT family
+2007.01282   # DPR-style
+2104.06979   # PromptCSE
+2104.08821   # SimCSE
+2202.08904   # GTR
+2210.07316   # ColBERTv2 (dup-safe)
+2305.07614   # text embedding survey
+2210.10634   # Sentence-T5
+2308.03281   # cohere multilingual
+
+# Modern LLM era
+2305.14314   # QLoRA
+2307.09288   # LLaMA 2 (already; dup-safe)
+2401.04088   # Mixtral 8x7B
+2310.06825   # Mistral 7B (already; dup-safe)
+2304.13712   # Survey LLMs
+2106.09685   # LoRA (already; dup-safe)
+2403.07816   # Branch-Train-Mix
+2402.17463   # GaLoRE
+2305.10601   # Tree of Thoughts
+2310.11511   # Self-RAG
+
+# Vision / multimodal
+2010.11929   # ViT (already; dup-safe)
+2103.14030   # Swin (already; dup-safe)
+2203.13474   # MAE
+2111.06377   # MAE (alt)
+2104.13921   # DINO
+2306.07879   # SAM 2 / OWL
+2304.07193   # DINOv2
+2103.00020   # CLIP (already; dup-safe)
+2207.13332   # FlashAttention
+2307.08691   # FlashAttention-2
+
+# ANN / vector search engineering
+2206.14286   # ScaNN learned quantization
+2110.06983   # AnyANN
+2203.07395   # Filtered ANN
+2207.01686   # IndexHNSW + IVF hybrid
+2102.05451   # SPANN
+2306.05095   # FreshDiskANN
+1908.10484   # IVF-PQ surveys
+2009.13003   # ScaNN compression
+2310.01361   # Vamana streaming
+
+# Speech / audio
+2212.04356   # Whisper (already; dup-safe)
+2002.05202   # Conformer
+
+# Classic ML revisits
+1502.03167   # BatchNorm (already; dup-safe)
+1607.06450   # LayerNorm (already; dup-safe)
+1607.08022   # Group conv
+1311.2901    # Visualizing CNNs (Zeiler)
+1511.06434   # DCGAN
+1701.07875   # WGAN
+
+# More NLP
+1806.02847   # XLNet
+1909.00204   # SpanBERT
+2104.06732   # GPT-Neo era
+2006.16668   # GShard
+2112.06905   # ChinchillA
+
