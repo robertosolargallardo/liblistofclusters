@@ -83,17 +83,18 @@ public:
     void remove(const std::vector<object_t> &objs,
                 const std::vector<uint32_t> &ids);
 
-    // Canonical static LC build from the original paper (Chavez & Navarro,
-    // PRL 2005, Figure 1). For each cluster we pick a center then take the
-    // bucket_size NEAREST points as its bucket (vs incremental insert, which
-    // packs whoever happens to fall inside the radius by arrival order).
-    // Clusters built this way are spatially tight, so triangle-inequality
-    // pruning fires more often at query time. Trades build time for query
-    // time, as the paper intends.
-    //
-    // Replaces any existing index state (clear() is called first).
+    // Canonical static LC build (Chavez & Navarro PRL 2005, §3) with two
+    // center-selection strategies:
+    //   - first_unassigned: paper-faithful; pick the lowest-index unassigned
+    //     point as the next center.
+    //   - farthest_first  : Gonzalez FFT [Gonzalez 1985]; pick the unassigned
+    //     point with the maximum min-distance to already-chosen centers.
+    //     Tighter, more separated clusters. Default.
+    enum class build_strategy { first_unassigned, farthest_first };
+
     void bulk_build(const std::vector<object_t> &objs,
-                    const std::vector<uint32_t> &ids);
+                    const std::vector<uint32_t> &ids,
+                    build_strategy strategy = build_strategy::farthest_first);
 
     // Queries are read-only with respect to the index: they only touch _list
     // and the (stateless) metric. Multiple knn_search/range_search/batch_knn
@@ -256,7 +257,8 @@ template <class object_t, class distance_t, size_t bucket_size, size_t overflow>
     requires Metric<distance_t, object_t>
 void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
     const std::vector<object_t> &objs,
-    const std::vector<uint32_t> &ids)
+    const std::vector<uint32_t> &ids,
+    build_strategy strategy)
 {
     this->clear();
     const std::size_t n = std::min(objs.size(), ids.size());
@@ -267,13 +269,43 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
     std::vector<std::pair<double, std::size_t>> scratch;
     scratch.reserve(n);
 
+    // For FFT: min-distance from each (still-unassigned) point to any
+    // already-chosen center. Updated incrementally to keep total distance
+    // count at O((n/m)*n), matching first_unassigned modulo constants.
+    // Reference: Gonzalez 1985, Theoretical Computer Science 38.
+    std::vector<double> min_to_center(n, std::numeric_limits<double>::infinity());
+
     this->_list.reserve(n / bucket_size + 1);
+
+    // Fixed seed for reproducible FFT seeding (test suite + bench A/B).
+    std::mt19937 rng(0xC0FFEEu);
 
     while (remaining > 0)
         {
-            // 1. Pick the first unassigned point as the next center.
+            // 1. Pick the next center.
             std::size_t c_idx = 0;
-            while (c_idx < n && assigned[c_idx]) ++c_idx;
+            if (this->_list.empty()) {
+                // First center: random unassigned (FFT) or first unassigned.
+                if (strategy == build_strategy::farthest_first) {
+                    std::uniform_int_distribution<std::size_t> pick(0, n - 1);
+                    do { c_idx = pick(rng); } while (assigned[c_idx]);
+                } else {
+                    while (c_idx < n && assigned[c_idx]) ++c_idx;
+                }
+            } else if (strategy == build_strategy::farthest_first) {
+                // FFT: argmax of min_to_center over unassigned points.
+                double best = -1.0;
+                std::size_t best_idx = 0;
+                bool any = false;
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (assigned[i]) continue;
+                    const double d = min_to_center[i];
+                    if (!any || d > best) { best = d; best_idx = i; any = true; }
+                }
+                c_idx = best_idx;
+            } else {
+                while (c_idx < n && assigned[c_idx]) ++c_idx;
+            }
             assigned[c_idx] = 1;
             --remaining;
 
@@ -285,13 +317,16 @@ void listofclusters<object_t,distance_t,bucket_size,overflow>::bulk_build(
                     break;
                 }
 
-            // 2. Distances from center to all other unassigned points.
+            // 2. Distances from center to all other unassigned points,
+            //    updating min_to_center incrementally for FFT's next pick.
             scratch.clear();
             scratch.reserve(remaining);
             for (std::size_t i = 0; i < n; ++i)
                 {
                     if (assigned[i]) continue;
-                    scratch.emplace_back(this->_metric(objs[c_idx], objs[i]), i);
+                    const double d = this->_metric(objs[c_idx], objs[i]);
+                    if (d < min_to_center[i]) min_to_center[i] = d;
+                    scratch.emplace_back(d, i);
                 }
 
             // 3. Bring the bucket_size nearest to the front (don't sort the tail).

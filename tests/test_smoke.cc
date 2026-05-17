@@ -572,6 +572,56 @@ static void test_simd_batched_euclidean_matches_scalar()
     std::cout << "  test_simd_batched_euclidean_matches_scalar: OK (n=" << n << ", dim=" << dim << ")\n";
 }
 
+// Phase 3.1: both build strategies must yield recall=1.000 against brute force.
+// The legacy first_unassigned path stays available for paper-faithful repro.
+static void test_bulk_build_strategies()
+{
+    constexpr std::uint32_t N = 200U;
+    constexpr std::size_t D = 6U;
+    constexpr std::size_t k = 5U;
+
+    std::vector<vec_t> db(N);
+    std::vector<std::uint32_t> ids(N);
+    std::mt19937 rng(83);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    for (std::uint32_t i = 0; i < N; ++i) {
+        db[i].resize(D);
+        for (std::size_t j = 0; j < D; ++j) db[i][j] = u(rng);
+        ids[i] = i;
+    }
+
+    auto check_recall = [&](idx_t::build_strategy strategy, const char *label) {
+        idx_t idx;
+        idx.bulk_build(db, ids, strategy);
+        assert(!idx.empty());
+        int hits = 0, expected = 0;
+        for (int q = 0; q < 10; ++q) {
+            vec_t query(D);
+            for (std::size_t j = 0; j < D; ++j) query[j] = u(rng);
+            std::vector<std::pair<double, std::uint32_t>> bf;
+            bf.reserve(N);
+            for (std::uint32_t i = 0; i < N; ++i) bf.emplace_back(bf_dist(query, db[i]), i);
+            std::sort(bf.begin(), bf.end());
+            std::vector<std::uint32_t> want;
+            for (std::size_t i = 0; i < k; ++i) want.push_back(bf[i].second);
+            auto res = idx.knn_search(query, N + q, k);
+            std::vector<std::uint32_t> got;
+            for (const auto &r : res.results()) got.push_back(r.id());
+            std::sort(want.begin(), want.end());
+            std::sort(got.begin(), got.end());
+            for (auto id : want) {
+                if (std::find(got.begin(), got.end(), id) != got.end()) ++hits;
+                ++expected;
+            }
+        }
+        assert(hits == expected && "bulk_build strategy missed brute-force neighbors");
+        std::cout << "  test_bulk_build_strategies[" << label << "]: OK (" << hits << "/" << expected << ")\n";
+    };
+
+    check_recall(idx_t::build_strategy::first_unassigned, "first_unassigned");
+    check_recall(idx_t::build_strategy::farthest_first,   "farthest_first");
+}
+
 // Phase 2.3: SIMD L1 / L∞ batched kernels must match the scalar functor.
 static void test_simd_batched_l1_linf_match_scalar()
 {
@@ -653,6 +703,7 @@ int main()
     test_scalar_batched_distance();
     test_simd_batched_euclidean_matches_scalar();
     test_simd_batched_l1_linf_match_scalar();
+    test_bulk_build_strategies();
     test_centers_soa_consistency();
     test_build_and_knn();
     test_range_search();
