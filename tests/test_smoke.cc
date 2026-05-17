@@ -1,5 +1,6 @@
 #include <listofclusters/listofclusters.hh>
 #include <listofclusters/metrics.hh>
+#include <listofclusters/detail/batched_distance.hh>
 
 #include <algorithm>
 #include <cassert>
@@ -497,9 +498,40 @@ static void test_batch_remove()
     std::cout << "  test_batch_remove: OK (removed " << N/2 << ", " << found << " survivors retrievable)\n";
 }
 
+// Phase 1.1: scalar batched-distance kernel cross-checks the metric functor
+// on a small set of centers. Also static_asserts the trait flips correctly.
+static void test_scalar_batched_distance()
+{
+    using v_t = std::vector<double>;
+    std::vector<double> centers = {
+        0.0, 0.0,
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const std::size_t dim = 2, n = 3;
+    const v_t q = {1.0, 1.0};
+
+    auto out = metric::detail::batched_distance(
+        metric::euclidean{}, q,
+        std::span<const double>(centers.data(), centers.size()), dim, n);
+
+    assert(out.size() == 3);
+    auto approx = [](double x, double y) { return std::abs(x - y) < 1e-9; };
+    assert(approx(out[0], std::sqrt(2.0)));
+    assert(approx(out[1], 1.0));
+    assert(approx(out[2], 1.0));
+
+    static_assert(metric::supports_batched_distance_v<metric::euclidean,  v_t>);
+    static_assert(metric::supports_batched_distance_v<metric::manhattan,  v_t>);
+    static_assert(metric::supports_batched_distance_v<metric::chebyshev,  v_t>);
+    static_assert(!metric::supports_batched_distance_v<metric::levenshtein, std::string>);
+    std::cout << "  test_scalar_batched_distance: OK\n";
+}
+
 int main()
 {
     std::cout << "liblistofclusters smoke tests:\n";
+    test_scalar_batched_distance();
     test_build_and_knn();
     test_range_search();
     test_equal_distance_strict_weak_ordering();

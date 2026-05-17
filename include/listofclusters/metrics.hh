@@ -331,4 +331,25 @@ inline constexpr std::size_t available_metrics_count =
     sizeof(available_metrics) / sizeof(available_metrics[0]);
 
 }  // namespace metric
+
+// Trait specializations marking which built-in metrics have a batched-distance
+// kernel. Per-metric SIMD overloads of detail::batched_distance are added in
+// detail/batched_distance.hh (Phase 2 of the optimization plan).
+#include <listofclusters/detail/batched_distance.hh>
+
+namespace metric {
+
+template <class Container>
+struct supports_batched_distance<euclidean, Container> : std::true_type {};
+template <class Container>
+struct supports_batched_distance<manhattan, Container> : std::true_type {};
+template <class Container>
+struct supports_batched_distance<chebyshev, Container> : std::true_type {};
+template <int p, class Container>
+struct supports_batched_distance<minkowski<p>, Container> : std::true_type {};
+template <std::size_t D>
+struct supports_batched_distance<euclidean_simd<D>, std::array<double, D>>
+    : std::true_type {};
+
+}  // namespace metric
 #endif
